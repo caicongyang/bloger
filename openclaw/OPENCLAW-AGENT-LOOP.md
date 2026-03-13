@@ -1,1355 +1,526 @@
-# OpenClaw Agent Loop 机制源码深度分析
+# OpenClaw Agent Loop 源码深度分析
 
-> 基于源码的全面解析，帮助你深入理解 OpenClaw 的 Agent 循环执行机制
+> 基于 `src/agents/pi-embedded-runner/` 源码的全面解析，深入理解 Agent 循环执行机制的设计理念和实现细节
 
 ## 目录
 
-- [概述](#概述)
-- [架构设计](#架构设计)
-- [核心组件](#核心组件)
-  - [运行器入口](#运行器入口)
-  - [执行尝试](#执行尝试)
-  - [会话压缩](#会话压缩)
-  - [运行状态管理](#运行状态管理)
-- [消息处理流程](#消息处理流程)
-  - [消息接收](#消息接收)
-  - [提示词构建](#提示词构建)
-  - [LLM 调用](#llm-调用)
-  - [工具执行循环](#工具执行循环)
-- [关键机制](#关键机制)
-  - [流式响应](#流式响应)
-  - [上下文管理](#上下文管理)
-  - [工具策略](#工具策略)
-  - [错误处理](#错误处理)
-- [生命周期](#生命周期)
-- [Mermaid 流程图](#mermaid-流程图)
-- [源码关键代码解读](#源码关键代码解读)
+- [设计理念](#设计理念)
+- [模块结构](#模块结构)
+- [外层运行循环：run.ts](#外层运行循环runts)
+  - [Lane 并发控制](#lane-并发控制)
+  - [模型解析与上下文窗口](#模型解析与上下文窗口)
+  - [Auth Profile 轮转](#auth-profile-轮转)
+  - [重试与 Failover 策略](#重试与-failover-策略)
+- [单次执行尝试：attempt.ts](#单次执行尝试attemptts)
+  - [Attempt 内部步骤](#attempt-内部步骤)
+  - [工具创建与分组](#工具创建与分组)
+  - [System Prompt 构建管线](#system-prompt-构建管线)
+  - [Tool Name Normalization](#tool-name-normalization)
+  - [sessions_yield 中断机制](#sessions_yield-中断机制)
+- [上下文窗口管理](#上下文窗口管理)
+  - [Context Window Guard](#context-window-guard)
+  - [Compaction Safeguard Extension](#compaction-safeguard-extension)
+  - [Tool Result Context Guard](#tool-result-context-guard)
+  - [Context Overflow 恢复策略](#context-overflow-恢复策略)
+- [会话压缩：compact.ts](#会话压缩compactts)
+- [运行状态管理：runs.ts](#运行状态管理runsts)
+- [载荷构建：payloads.ts](#载荷构建payloadsts)
+- [错误处理与恢复](#错误处理与恢复)
+- [生命周期状态机](#生命周期状态机)
+- [关键常量参考](#关键常量参考)
 - [常见问题](#常见问题)
 
 ---
 
-## 概述
+## 设计理念
 
-OpenClaw 的 **Agent Loop（代理循环）** 是系统的核心执行引擎，负责接收消息、构建上下文、调用 LLM、执行工具、处理响应，形成一个完整的对话循环。
+Agent Loop 的设计回答了一个核心问题：**如何在不可靠的 LLM API 上构建一个可靠的、可自愈的执行引擎？**
 
-### 核心特性
+设计哲学：
 
-```mermaid
-graph TB
-    subgraph "Agent Loop"
-        A[接收消息] --> B[构建上下文]
-        B --> C[调用 LLM]
-        C --> D{有工具调用?}
-        D -->|是| E[执行工具]
-        E --> C
-        D -->|否| F[返回结果]
-        F --> G[压缩上下文]
-        G --> A
-    end
-    
-    subgraph "支持功能"
-        H[流式响应]
-        I[上下文窗口管理]
-        J[工具策略控制]
-        K[错误恢复]
-    end
-```
-
-### 循环流程
-
-```mermaid
-flowchart TD
-    A[开始] --> B[接收消息]
-    B --> C[构建系统提示词]
-    C --> D[加载会话历史]
-    D --> E[调用 LLM]
-    E --> F{工具调用?}
-    F -->|有| G[执行工具]
-    G --> E
-    F -->|无| H[生成回复]
-    H --> I[压缩会话]
-    I --> J{继续?}
-    J -->|是| B
-    J -->|否| K[结束]
-```
+1. **重试优先于失败**：LLM API 的错误（rate limit、auth 过期、context overflow）多数是瞬时的。通过 Auth profile 轮转、context compaction、backoff 等机制，尽可能自动恢复，而非直接报错给用户。
+2. **Lane 并发控制**：同一 session 的请求串行化（session lane），全局请求受限（global lane），避免 API 配额竞争和会话状态冲突。
+3. **渐进式上下文管理**：不是一次性加载所有历史，而是通过 compaction safeguard 主动裁剪、tool result guard 预防性截断、overflow 后多级恢复，保持上下文在窗口内。
+4. **Provider 容错**：不同 LLM provider 返回的工具调用格式有差异（工具名异常、消息顺序等），通过 normalization 层统一处理。
 
 ---
 
-## 架构设计
-
-### 模块结构
+## 模块结构
 
 ```
 src/agents/pi-embedded-runner/
-├── run.ts                          # 主运行入口
+├── run.ts                              # 外层运行循环：lane 入队、模型解析、auth 轮转、重试
 ├── run/
-│   ├── params.ts                  # 运行参数
-│   ├── attempt.ts                 # 单次执行尝试
-│   ├── payloads.ts                # 载荷构建
-│   └── images.ts                  # 图片处理
-├── compact.ts                      # 会话压缩
-├── runs.ts                         # 运行状态管理
-├── history.ts                      # 历史管理
-├── lanes.ts                        # 执行队列通道
-├── system-prompt.ts               # 系统提示词构建
-├── tool-split.ts                  # 工具拆分
-├── tool-result-truncation.ts      # 工具结果截断
-├── types.ts                       # 类型定义
-└── utils.ts                       # 工具函数
-```
-
-### 核心类型定义
-
-```typescript
-// types.ts
-
-export type EmbeddedPiRunResult = {
-  success: boolean;
-  reply?: string;
-  usage?: Usage;
-  error?: string;
-};
-
-export type EmbeddedPiAgentMeta = {
-  runId: string;
-  sessionId: string;
-  provider: string;
-  modelId: string;
-  thinkLevel: ThinkLevel;
-};
-
-// 运行状态
-export type EmbeddedPiRunStatus =
-  | { status: "idle" }
-  | { status: "streaming" }
-  | { status: "compacting" }
-  | { status: "completed" }
-  | { status: "error"; error: string };
+│   ├── attempt.ts                      # 单次尝试：sandbox、skills、prompt、工具、LLM 调用
+│   ├── params.ts                       # RunEmbeddedPiAgentParams 类型
+│   ├── payloads.ts                     # 回复载荷构建（文本、媒体、错误、推理）
+│   ├── types.ts                        # EmbeddedRunAttemptParams, EmbeddedRunAttemptResult
+│   └── images.ts                       # 图片处理
+├── compact.ts                          # 会话压缩（direct 和 queued 两种模式）
+├── runs.ts                             # 活跃运行状态：消息队列、中断、等待
+├── skills-runtime.ts                   # Skills 加载和快照解析
+├── system-prompt.ts                    # 系统提示词构建
+├── history.ts                          # 历史轮次限制
+├── extensions.ts                       # Extension factories (compaction safeguard, context pruning)
+├── tool-result-truncation.ts           # 工具结果超大截断
+├── tool-result-context-guard.ts        # 工具结果上下文保护（预防性截断）
+├── tool-result-char-estimator.ts       # Token/char 估算
+├── compaction-safety-timeout.ts        # 压缩超时保护
+├── session-manager-init.ts             # SessionManager 初始化
+├── wait-for-idle-before-flush.ts       # 空闲后刷新待处理工具结果
+├── types.ts                            # EmbeddedPiAgentMeta, EmbeddedPiRunResult
+└── lanes.ts                            # Lane 定义
 ```
 
 ---
 
-## 核心组件
+## 外层运行循环：run.ts
 
-### 运行器入口
+入口函数 `runEmbeddedPiAgent()` 是 Agent Loop 的最外层，负责并发控制、模型解析、认证轮转和重试逻辑。
 
-**文件**: `run.ts`
+### Lane 并发控制
 
-主入口函数，处理整个运行生命周期。
-
-```typescript
-export async function runEmbeddedPiAgent(
-  params: RunEmbeddedPiAgentParams,
-): Promise<EmbeddedPiRunResult> {
-  const sessionLane = resolveSessionLane(params.sessionKey || params.sessionId);
-  
-  return enqueueSession(() =>
-    enqueueGlobal(async () => {
-      // 1. 准备工作区
-      const workspaceResolution = resolveRunWorkspaceDir({...});
-      const resolvedWorkspace = workspaceResolution.workspaceDir;
-      
-      // 2. 解析模型配置
-      const { model, error, authStorage } = resolveModel(
-        provider, modelId, agentDir, params.config
-      );
-      
-      if (!model) {
-        throw new Error(error ?? `Unknown model: ${provider}/${modelId}`);
-      }
-      
-      // 3. 检查上下文窗口
-      const ctxInfo = resolveContextWindowInfo({...});
-      const ctxGuard = evaluateContextWindowGuard({...});
-      
-      // 4. 执行循环
-      const result = await runEmbeddedAttempt({
-        ...params,
-        model,
-        authStorage,
-        workspaceDir: resolvedWorkspace,
-        sessionId: redactedSessionId,
-      });
-      
-      return result;
-    })
-  );
-}
-```
-
-**参数定义**:
-
-```typescript
-type RunEmbeddedPiAgentParams = {
-  message: string;              // 用户消息
-  sessionId: string;            // 会话 ID
-  sessionKey?: string;         // 会话 Key
-  agentId?: string;            // Agent ID
-  provider?: string;           // 模型提供商
-  model?: string;             // 模型名称
-  workspaceDir?: string;      // 工作区目录
-  config?: OpenClawConfig;    // 配置
-  messageChannel?: string;   // 消息通道
-  messageProvider?: string;   // 消息提供商
-  // ... 更多参数
-};
-```
-
-### 执行尝试
-
-**文件**: `run/attempt.ts`
-
-单个执行尝试，包含完整的 LLM 调用和工具执行循环。
-
-```typescript
-export async function runEmbeddedAttempt(
-  params: EmbeddedRunAttemptParams,
-): Promise<EmbeddedRunAttemptResult> {
-  const workspace = resolveUserPath(params.workspaceDir);
-  
-  // 1. 解析沙箱配置
-  const sandbox = await resolveSandboxContext({
-    config: params.config,
-    sessionKey: params.sessionKey || params.sessionId,
-    workspaceDir: workspace,
-  });
-  
-  // 2. 加载 Skills
-  const skillEntries = loadWorkspaceSkillEntries(workspace);
-  const skillsPrompt = resolveSkillsPromptForRun({...});
-  
-  // 3. 构建系统提示词
-  const { systemPrompt, snapshot } = buildEmbeddedSystemPrompt({...});
-  
-  // 4. 准备会话管理器
-  const sessionManager = await prepareSessionManagerForRun({
-    sessionId: params.sessionId,
-    sessionKey: params.sessionKey,
-    systemPrompt,
-    workspaceDir: workspace,
-    config: params.config,
-  });
-  
-  // 5. 构建工具定义
-  const tools = await toClientToolDefinitions({
-    config: params.config,
-    sessionManager,
-    sandbox,
-  });
-  
-  // 6. 注册运行状态
-  const handle = registerRun({
-    sessionId: params.sessionId,
-    sessionManager,
-  });
-  
-  try {
-    // 7. 发送用户消息
-    await sessionManager.appendUserMessage(params.message);
-    
-    // 8. 执行主循环
-    while (true) {
-      // 调用 LLM
-      const response = await sessionManager.complete({
-        model: params.modelId,
-        tools,
-        thinking: params.thinkLevel,
-      });
-      
-      // 检查是否有工具调用
-      if (response.tool_calls?.length > 0) {
-        // 执行工具
-        for (const toolCall of response.tool_calls) {
-          const result = await executeTool(toolCall);
-          await sessionManager.appendToolResult(toolCall.id, toolCall.name, result);
-        }
-        continue;  // 继续循环
-      }
-      
-      // 没有工具调用，返回结果
-      return {
-        success: true,
-        reply: response.content,
-        usage: response.usage,
-      };
-    }
-  } finally {
-    unregisterRun(params.sessionId);
-  }
-}
-```
-
-### 会话压缩
-
-**文件**: `compact.ts`
-
-管理上下文窗口，避免超出限制。
-
-```typescript
-export async function compactEmbeddedPiSession(
-  params: CompactEmbeddedPiSessionParams,
-): Promise<EmbeddedPiCompactResult> {
-  const { sessionManager } = await prepareSessionManagerForRun({...});
-  
-  // 1. 检查是否需要压缩
-  const needsCompaction = await sessionManager.needsCompaction();
-  
-  if (!needsCompaction) {
-    return { ok: true, compacted: false };
-  }
-  
-  // 2. 估算压缩后的令牌数
-  const estimate = await sessionManager.compactionEstimate();
-  
-  // 3. 执行压缩
-  const result = await sessionManager.compact({
-    systemPrompt: buildSystemPrompt(),
-    reserveTokens: resolveCompactionReserveTokensFloor(params.config),
-  });
-  
-  if (result.success) {
-    return {
-      ok: true,
-      compacted: true,
-      originalTokens: estimate.originalTokens,
-      compactedTokens: result.tokenCount,
-    };
-  }
-  
-  return {
-    ok: false,
-    compacted: false,
-    reason: result.error,
-  };
-}
-```
-
-### 运行状态管理
-
-**文件**: `runs.ts`
-
-跟踪当前运行的会话状态。
-
-```typescript
-// 活动运行映射
-const ACTIVE_EMBEDDED_RUNS = new Map<string, EmbeddedPiQueueHandle>();
-
-// 等待器映射
-const EMBEDDED_RUN_WAITERS = new Map<string, Set<EmbeddedRunWaiter>>();
-
-// 注册活动运行
-export function setActiveEmbeddedRun(
-  sessionId: string,
-  handle: EmbeddedPiQueueHandle
-) {
-  ACTIVE_EMBEDDED_RUNS.set(sessionId, handle);
-}
-
-// 检查是否有活动运行
-export function isEmbeddedPiRunActive(sessionId: string): boolean {
-  return ACTIVE_EMBEDDED_RUNS.has(sessionId);
-}
-
-// 队列消息（用于流式响应）
-export function queueEmbeddedPiMessage(sessionId: string, text: string): boolean {
-  const handle = ACTIVE_EMBEDDED_RUNS.get(sessionId);
-  if (!handle) return false;
-  
-  handle.queueMessage(text);
-  return true;
-}
-
-// 中断运行
-export function abortEmbeddedPiRun(sessionId: string): boolean {
-  const handle = ACTIVE_EMBEDDED_RUNS.get(sessionId);
-  if (!handle) return false;
-  
-  handle.abort();
-  return true;
-}
-```
-
----
-
-## 消息处理流程
-
-### 消息接收
-
-```mermaid
-sequenceDiagram
-    participant Gateway
-    participant RunParams
-    participant SessionManager
-    
-    Gateway->>RunParams: 接收消息和会话信息
-    RunParams->>SessionManager: 创建/加载会话
-    SessionManager-->>RunParams: 会话就绪
-```
-
-```typescript
-// 从参数构建运行上下文
-async function prepareRunContext(params) {
-  // 1. 解析会话
-  const sessionManager = await prepareSessionManagerForRun({
-    sessionId: params.sessionId,
-    sessionKey: params.sessionKey,
-    workspaceDir: params.workspaceDir,
-    config: params.config,
-  });
-  
-  // 2. 加载引导文件
-  const { bootstrapFiles, contextFiles } = await resolveBootstrapContextForRun({
-    workspaceDir: params.workspaceDir,
-    config: params.config,
-    sessionKey: params.sessionKey,
-  });
-  
-  return { sessionManager, bootstrapFiles, contextFiles };
-}
-```
-
-### 提示词构建
+每次 Agent 运行首先入队两层 lane：
 
 ```mermaid
 flowchart LR
-    A[Bootstrap 文件] --> D[系统提示词]
-    B[Skills] --> D
-    C[上下文文件] --> D
-    D --> E[最终提示词]
-    
-    subgraph "构建步骤"
-    D1[拼接身份信息]
-    D2[添加引导规则]
-    D3[合并 Skills]
-    D4[添加时间/环境信息]
-    end
-    
-    D --> D1
-    D --> D2
-    D --> D3
-    D --> D4
+    REQ[请求] --> SL["resolveSessionLane\n(同 session 串行)"]
+    SL --> GL["resolveGlobalLane\n(全局并发限制)"]
+    GL --> RUN[runEmbeddedAttempt]
 ```
 
-```typescript
-// 构建系统提示词
-function buildEmbeddedSystemPrompt(params) {
-  const { sessionManager, config, workspaceDir, bootstrapFiles } = params;
-  
-  // 1. 基础身份
-  const identity = buildIdentitySection();
-  
-  // 2. 引导文件内容
-  const bootstrap = loadBootstrapFiles(bootstrapFiles);
-  
-  // 3. Skills 提示
-  const skills = resolveSkillsPromptForRun({
-    config,
-    workspaceDir,
-  });
-  
-  // 4. 工具描述
-  const tools = buildToolDescriptions();
-  
-  // 5. 合并所有部分
-  return [
-    identity,
-    bootstrap,
-    skills,
-    tools,
-  ].join("\n\n---\n\n");
-}
-```
+- **Session Lane**：同一个 session 的请求必须串行执行，避免会话状态冲突
+- **Global Lane**：全局并发上限，防止同时向 LLM API 发送过多请求
 
-### LLM 调用
+### 模型解析与上下文窗口
 
 ```mermaid
-sequenceDiagram
-    participant SessionManager
-    participant LLM
-    participant Tools
-    
-    SessionManager->>LLM: complete(message, tools, thinking)
-    LLM-->>SessionManager: streaming response
-    
-    alt 有工具调用
-        SessionManager->>Tools: execute(tool_call)
-        Tools-->>SessionManager: tool result
-        SessionManager->>LLM: 继续对话
-    else 无工具调用
-        LLM-->>SessionManager: final response
-    end
+flowchart TD
+    HK1["before_model_resolve hook\n(provider/model override)"] --> HK2["before_agent_start hook"]
+    HK2 --> RM["resolveModel()\n→ model + authStorage"]
+    RM --> CW["resolveContextWindowInfo()\n→ token 上限"]
+    CW --> CG["evaluateContextWindowGuard()"]
+    CG --> W{shouldWarn?}
+    W -->|是| WARN[发出低上下文警告]
+    CG --> B{shouldBlock?}
+    B -->|是| BLOCK[拒绝执行]
+    B -->|否| RUN[继续执行]
 ```
 
-```typescript
-// 执行 LLM 调用
-async function callLLM(params) {
-  const { sessionManager, model, tools, thinking } = params;
-  
-  const response = await sessionManager.complete({
-    model,
-    tools,
-    thinking,
-    
-    // 流式回调
-    onChunk: (chunk) => {
-      // 处理流式响应
-      handleStreamingChunk(chunk);
-    },
-    
-    onComplete: (response) => {
-      // 处理完成
-      handleComplete(response);
-    },
-  });
-  
-  return response;
-}
-```
+**上下文窗口解析链**：`modelsConfig` → `model.contextWindow` → `defaultTokens`，再受 `agents.defaults.contextTokens` 上限约束。
 
-### 工具执行循环
+**硬限制**：
+- `CONTEXT_WINDOW_HARD_MIN_TOKENS = 16,000` — 低于此值直接阻止执行
+- `CONTEXT_WINDOW_WARN_BELOW_TOKENS = 32,000` — 低于此值发出警告
+
+### Auth Profile 轮转
+
+OpenClaw 支持配置多个 API 认证 profile。当一个 profile 遇到 auth 错误、rate limit、billing 问题时，自动切换到下一个。
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Idle: 等待输入
-    
-    Idle --> CallingLLM: 用户消息
-    CallingLLM --> ProcessingLLM: LLM 响应
-    
-    ProcessingLLM --> HasToolCalls: 有工具调用?
-    HasToolCalls -->|是| ExecutingTools: 执行工具
-    ExecutingTools --> CallingLLM: 继续 LLM
-    HasToolCalls -->|否| GeneratingReply: 生成回复
-    
-    GeneratingReply --> Idle: 返回结果
-    GeneratingReply --> Compacting: 需要压缩?
-    Compacting -->|是| Compacting: 压缩上下文
-    Compacting --> Idle
+    [*] --> ResolveOrder: resolveAuthProfileOrder
+    ResolveOrder --> Profile1: 尝试 profile 1
+    Profile1 --> Success: API 调用成功
+    Profile1 --> Failed: auth/rate-limit/billing 错误
+    Failed --> MarkFailure: markAuthProfileFailure
+    MarkFailure --> Advance: advanceAuthProfile
+    Advance --> Profile2: 尝试 profile 2
+    Profile2 --> Success
+    Profile2 --> Failed2: 所有 profile 耗尽
+    Failed2 --> CooldownProbe: allowTransientCooldownProbe?
+    CooldownProbe --> ProbeAttempt: 一次探测尝试
+    ProbeAttempt --> Success
+    ProbeAttempt --> FailoverError: FailoverError → 模型 fallback
+    Success --> MarkGood: markAuthProfileGood
+    MarkGood --> [*]
 ```
 
-```typescript
-// 主执行循环
-async function executeLoop(params) {
-  const { sessionManager, tools } = params;
-  
-  // 1. 发送用户消息
-  await sessionManager.appendUserMessage(params.message);
-  
-  // 2. 循环直到没有工具调用
-  while (true) {
-    // 2.1 调用 LLM
-    const response = await sessionManager.complete({
-      model: params.modelId,
-      tools,
-      thinking: params.thinkLevel,
-    });
-    
-    // 2.2 检查工具调用
-    if (response.tool_calls?.length > 0) {
-      // 2.3 执行所有工具调用
-      for (const toolCall of response.tool_calls) {
-        const result = await executeTool(toolCall);
-        
-        // 2.4 添加工具结果到会话
-        await sessionManager.appendToolResult(
-          toolCall.id,
-          toolCall.name,
-          result
-        );
-      }
-      
-      // 2.5 继续循环
-      continue;
-    }
-    
-    // 3. 没有工具调用，完成
-    return {
-      success: true,
-      reply: response.content,
-      usage: response.usage,
-    };
-  }
-}
+**Transient Cooldown Probe**：当所有 profile 都进入冷却期（原因为 rate_limit、overloaded、billing、unknown 等瞬时原因时），允许做一次额外探测尝试。
+
+**Overload Backoff**：`OVERLOAD_FAILOVER_BACKOFF_POLICY`（250ms-1.5s），在 overload failover 前短暂等待。
+
+### 重试与 Failover 策略
+
+```mermaid
+flowchart TD
+    ATT[runEmbeddedAttempt] --> OK{成功?}
+    OK -->|是| DONE[返回结果]
+    OK -->|否| ERR{错误类型}
+    ERR -->|context overflow| CO[contextEngine.compact]
+    CO --> CO_OK{compact 成功?}
+    CO_OK -->|是| ATT
+    CO_OK -->|否| CO_CNT{尝试次数 < 3?}
+    CO_CNT -->|是| TRUNC[truncateOversizedToolResults]
+    TRUNC --> ATT
+    CO_CNT -->|否| FAIL[返回错误]
+    ERR -->|auth/rate-limit/billing| AUTH[advanceAuthProfile]
+    AUTH --> AUTH_OK{有可用 profile?}
+    AUTH_OK -->|是| ATT
+    AUTH_OK -->|否| FO{hasConfiguredModelFallbacks?}
+    FO -->|是| FOERR[throw FailoverError]
+    FO -->|否| FAIL
+    ERR -->|thinking 不支持| TH[pickFallbackThinkingLevel]
+    TH --> ATT
+    ERR -->|超时/其他| FAIL
 ```
 
 ---
 
-## 关键机制
+## 单次执行尝试：attempt.ts
 
-### 流式响应
+### Attempt 内部步骤
+
+`runEmbeddedAttempt()` 是单次 LLM 调用的完整流程：
 
 ```mermaid
 flowchart TD
-    A[LLM 流式响应] --> B[接收 chunk]
-    B --> C[解析内容]
-    C --> D[增量更新回复]
-    D --> E{还有数据?}
-    E -->|是| B
-    E -->|否| F[完成]
+    SB["1. resolveSandboxContext()"] --> SK["2. resolveEmbeddedRunSkillEntries()\n→ applySkillEnvOverrides()"]
+    SK --> BS["3. resolveBootstrapContextForRun()\n+ analyzeBootstrapBudget()"]
+    BS --> TL["4. createOpenClawCodingTools()\n→ sanitizeToolsForGoogle()\n→ splitSdkTools()"]
+    TL --> SM["5. SessionManager.open()\n+ guardSessionManager()"]
+    SM --> SP["6. buildEmbeddedSystemPrompt()\n→ createSystemPromptOverride()\n→ applySystemPromptOverrideToSession()"]
+    SP --> TG["7. installToolResultContextGuard()"]
+    TG --> SUB["8. subscribeEmbeddedPiSession()\n(流式事件订阅)"]
+    SUB --> ACT["9. setActiveEmbeddedRun()\n(注册 QueueHandle)"]
+    ACT --> PROMPT["10. activeSession.prompt()\n(LLM 调用)"]
+    PROMPT --> WAIT["11. waitForCompactionRetryWithAggregateTimeout(60s)"]
+    WAIT --> POST["12. contextEngine.afterTurn()"]
 ```
 
-```typescript
-// 流式响应处理
-async function handleStreaming(params) {
-  const { sessionManager, onChunk } = params;
-  
-  // 累积响应
-  let accumulatedContent = "";
-  
-  await sessionManager.complete({
-    model: params.modelId,
-    tools: params.tools,
-    thinking: params.thinking,
-    
-    // 流式回调
-    onChunk: async (chunk) => {
-      if (chunk.content) {
-        accumulatedContent += chunk.content;
-        
-        // 发送增量更新
-        onChunk?.({
-          type: "content",
-          content: chunk.content,
-          fullContent: accumulatedContent,
-        });
-      }
-      
-      if (chunk.tool_use) {
-        // 工具调用开始
-        onChunk?.({
-          type: "tool_call",
-          tool: chunk.tool_use.name,
-          id: chunk.tool_use.id,
-        });
-      }
-    },
-  });
-}
-```
+### 工具创建与分组
 
-### 上下文管理
+工具创建经过三层处理：
 
 ```mermaid
 flowchart LR
-    A[新消息] --> B[添加到历史]
-    B --> C{超出窗口?}
-    C -->|是| D[压缩]
-    C -->|否| E[继续]
-    D --> E
-    E --> F[LLM 调用]
+    CREATE["createOpenClawCodingTools()"] --> SANITIZE["sanitizeToolsForGoogle()\n(Gemini 兼容性)"]
+    SANITIZE --> SPLIT["splitSdkTools({ sandboxEnabled })"]
+    SPLIT --> BT["builtInTools\n(SDK 内置工具)"]
+    SPLIT --> CT["customTools\n(OpenClaw 工具)"]
+    SPLIT --> CLT["clientToolDefs\n(OpenResponses hosted tools)"]
 ```
 
-```typescript
-// 上下文窗口管理
-async function manageContext(params) {
-  const { sessionManager, config } = params;
-  
-  // 1. 检查当前上下文大小
-  const info = await sessionManager.contextInfo();
-  
-  if (info.tokenCount > config.contextWindow * 0.9) {
-    // 2. 需要压缩
-    const result = await sessionManager.compact({
-      systemPrompt: buildSystemPrompt(),
-      reserveTokens: resolveCompactionReserveTokensFloor(config),
-    });
-    
-    if (!result.success) {
-      throw new Error("Compaction failed: " + result.error);
-    }
-    
-    return { compacted: true, originalTokens: info.tokenCount };
-  }
-  
-  return { compacted: false, originalTokens: info.tokenCount };
-}
-```
+- **builtInTools**：Pi SDK 提供的基础工具（read、write、edit、bash、grep 等）
+- **customTools**：OpenClaw 扩展工具（sessions_send、sessions_spawn、memory_search 等）
+- **clientToolDefs**：通过 `toClientToolDefinitions()` 暴露给 OpenResponses 的工具
 
-### 工具策略
+### System Prompt 构建管线
 
 ```mermaid
-flowchart TD
-    A[工具调用请求] --> B[解析工具名称]
-    B --> C{在白名单?}
-    C -->|否| D[拒绝调用]
-    C -->|是| E{在黑名单?}
-    E -->|是| D
-    E -->|否| F[执行工具]
-    F --> G[返回结果]
+flowchart LR
+    BSP["buildEmbeddedSystemPrompt()"] --> CSP["createSystemPromptOverride()"]
+    CSP --> ASP["applySystemPromptOverrideToSession()"]
 ```
 
-```typescript
-// 工具策略检查
-async function checkToolPolicy(params) {
-  const { toolName, config, session } = params;
-  
-  // 获取工具策略
-  const policy = resolveSandboxToolPolicyForAgent(
-    config,
-    session.agentId
-  );
-  
-  // 检查是否允许
-  if (!isToolAllowed(policy, toolName)) {
-    return {
-      allowed: false,
-      reason: `Tool "${toolName}" is blocked by policy`,
-    };
-  }
-  
-  return { allowed: true };
-}
-```
+`buildEmbeddedSystemPrompt()` 接收：
+- Bootstrap 文件内容（AGENTS.md、SOUL.md 等）
+- Skills prompt（由 `resolveSkillsPromptForRun()` 生成）
+- 配置信息（agent 身份、工具描述、环境信息）
 
-### 错误处理
+### Tool Name Normalization
 
-```mermaid
-flowchart TD
-    A[发生错误] --> B{错误类型?}
-    B -->|可恢复| C[重试]
-    B -->|上下文溢出| D[压缩重试]
-    B -->|认证失败| E[切换认证]
-    B -->|其他| F[返回错误]
-    
-    C --> G{重试次数?}
-    C -->|是| H[等待后重试]
-    H --> A
-    C -->|否| F
-    
-    D --> I[压缩上下文]
-    I --> A
-    
-    E --> J[使用备选密钥]
-    J --> A
-```
+不同 LLM provider 返回的工具调用名可能有异常（前缀、后缀、大小写问题）。OpenClaw 通过 normalization 层处理：
 
-```typescript
-// 错误处理和重试
-async function handleError(params) {
-  const { error, sessionManager, retryCount } = params;
-  
-  if (isContextOverflowError(error)) {
-    // 1. 上下文溢出，尝试压缩
-    const compactResult = await sessionManager.compact({
-      systemPrompt: buildSystemPrompt(),
-      reserveTokens: resolveCompactionReserveTokensFloor(),
-    });
-    
-    if (compactResult.success && retryCount < MAX_RETRIES) {
-      return { action: "retry", reason: "compacted" };
-    }
-  }
-  
-  if (isAuthError(error)) {
-    // 2. 认证错误，尝试切换
-    const failover = await attemptAuthFailover(sessionManager);
-    if (failover.success) {
-      return { action: "retry", reason: "auth_failover" };
-    }
-  }
-  
-  if (isRateLimitError(error)) {
-    // 3. 速率限制，等待后重试
-    await sleep(getRetryDelay(error));
-    return { action: "retry", reason: "rate_limit" };
-  }
-  
-  // 4. 其他错误
-  return { action: "fail", error: error.message };
-}
-```
+- `normalizeToolCallNameForDispatch()`：分发前规范化工具名
+- `inferToolNameFromToolCallId()`：从 tool_call_id 推断工具名（当 provider 返回空名时）
+- `wrapStreamTrimToolCallNames()`：在流式阶段修剪工具名异常
+
+### sessions_yield 中断机制
+
+`sessions_yield` 是一种特殊的工具调用，允许 Agent 主动"让出"控制权：
+
+- `onYield` 回调 → `queueSessionsYieldInterruptMessage()`
+- `stripSessionsYieldArtifacts()` 清理 yield 产生的痕迹
+- `persistSessionsYieldContextMessage()` 持久化 yield 上下文
+- yield 中断被视为 clean stop，不算错误
 
 ---
 
-## 生命周期
+## 上下文窗口管理
 
-### 完整生命周期
+上下文管理是 Agent Loop 最复杂的部分之一。OpenClaw 采用多层防御策略：
+
+```mermaid
+flowchart TD
+    subgraph proactive [主动防御]
+        CS["Compaction Safeguard\n(maxHistoryShare)"]
+        CP["Context Pruning\n(extension)"]
+    end
+
+    subgraph reactive [被动防御]
+        TG["Tool Result Context Guard\n(预防性截断)"]
+        TR["Tool Result Truncation\n(超大结果截断)"]
+    end
+
+    subgraph recovery [溢出恢复]
+        OV["Context Overflow 检测"]
+        CM["contextEngine.compact()\n(最多3次)"]
+        TT["truncateOversizedToolResults\n(compact 失败后)"]
+    end
+
+    proactive --> reactive
+    reactive --> recovery
+```
+
+### Context Window Guard
+
+`context-window-guard.ts` 在执行前评估上下文窗口是否足够：
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| `CONTEXT_WINDOW_HARD_MIN_TOKENS` | 16,000 | 低于此值阻止执行 |
+| `CONTEXT_WINDOW_WARN_BELOW_TOKENS` | 32,000 | 低于此值发出警告 |
+
+### Compaction Safeguard Extension
+
+`extensions.ts` → `compactionSafeguardExtension`（当 compaction mode 为 `"safeguard"` 时启用）：
+
+- `maxHistoryShare`：限制历史对话占总上下文的比例
+- `pruneHistoryForContextShare()`：当历史超出比例时主动裁剪
+- Quality guard：确保裁剪不会损害对话质量
+
+这是一个 `extensionFactory`，在 `createAgentSession` 时注入。
+
+### Tool Result Context Guard
+
+`tool-result-context-guard.ts` → `installToolResultContextGuard()`：
+
+在 Agent 的 `transformContext` 钩子中安装，**在每次 LLM 调用前**检查工具结果是否占用过多上下文，预防性截断大型工具结果。
+
+关键参数：
+- `MAX_TOOL_RESULT_CONTEXT_SHARE = 0.3`：单个工具结果最多占上下文的 30%
+- `HARD_MAX_TOOL_RESULT_CHARS = 400,000`：单个工具结果的绝对上限
+
+截断策略（`truncateToolResultText()`）：保留头部 + 尾部（当尾部包含错误信息或 JSON 时优先保留尾部）。
+
+### Context Overflow 恢复策略
+
+当 LLM API 返回 context overflow 错误时，`run.ts` 的恢复流程：
+
+```
+尝试 1: contextEngine.compact()
+尝试 2: contextEngine.compact() (如果第一次 compact 后仍然 overflow)
+尝试 3: contextEngine.compact() (第三次机会)
+所有 compact 失败: truncateOversizedToolResultsInSession()
+  → sessionLikelyHasOversizedToolResults() 检测是否有超大结果
+  → 截断后重新尝试
+```
+
+最大 overflow compaction 尝试次数：`MAX_OVERFLOW_COMPACTION_ATTEMPTS = 3`
+
+---
+
+## 会话压缩：compact.ts
+
+提供两种压缩模式：
+
+| 模式 | 函数 | 说明 |
+|------|------|------|
+| Direct | `compactEmbeddedPiSessionDirect()` | 无 lane 排队，用于已在 lane 内的场景 |
+| Queued | `compactEmbeddedPiSession()` | 入队 session + global lane |
+
+**压缩流程**：
+
+```mermaid
+flowchart TD
+    RM["解析 compaction model\n(config override 或 caller 提供)"] --> SK["加载 Skills\n(resolveEmbeddedRunSkillEntries)"]
+    SK --> TL["创建工具\n(createOpenClawCodingTools → splitSdkTools)"]
+    TL --> SM["SessionManager.open()\n+ guardSessionManager()"]
+    SM --> SH["sanitizeSessionHistory()\n→ validateAnthropicTurns()\n→ validateGeminiTurns()\n→ limitHistoryTurns()"]
+    SH --> BH["before_compaction hook"]
+    BH --> CP["session.compact()\n通过 compactWithSafetyTimeout()"]
+    CP --> AH["after_compaction hook"]
+    AH --> SE["runPostCompactionSideEffects()\n→ transcript 更新\n→ memory sync"]
+```
+
+**关键细节**：
+- Compaction 有独立的超时保护：`compactWithSafetyTimeout()`
+- `sanitizeSessionHistory()` 在 compact 前修复 provider-specific 的消息格式问题
+- 在 compact 流程中 `ctx.model` 为 undefined；compaction safeguard 使用 `runtime.model` 替代
+
+---
+
+## 运行状态管理：runs.ts
+
+`runs.ts` 通过一个 singleton `embeddedRunState` 管理所有活跃的 Agent 运行：
+
+```typescript
+interface EmbeddedRunState {
+  activeRuns: Map<string, EmbeddedPiQueueHandle>;
+  waiters: Map<string, Set<EmbeddedRunWaiter>>;
+}
+
+interface EmbeddedPiQueueHandle {
+  queueMessage: (text: string) => void;   // 向运行中的 Agent 追加消息
+  isStreaming: () => boolean;              // 是否正在流式输出
+  isCompacting: () => boolean;            // 是否正在压缩
+  abort: () => void;                       // 中断运行
+}
+```
+
+**API**：
+
+| 函数 | 说明 |
+|------|------|
+| `setActiveEmbeddedRun(sessionId, handle)` | 注册活跃运行 |
+| `clearActiveEmbeddedRun(sessionId)` | 清除运行 |
+| `queueEmbeddedPiMessage(sessionId, text)` | 追加消息（仅当运行活跃且正在流式时） |
+| `abortEmbeddedPiRun(sessionId)` | 中断指定运行 |
+| `abortEmbeddedPiRun(undefined, { mode: "all" })` | 中断所有运行 |
+| `abortEmbeddedPiRun(undefined, { mode: "compacting" })` | 仅中断正在压缩的运行 |
+| `waitForActiveEmbeddedRuns(timeoutMs)` | 等待所有运行结束（用于重启） |
+| `waitForEmbeddedPiRunEnd(sessionId, timeoutMs)` | 等待指定运行结束 |
+
+---
+
+## 载荷构建：payloads.ts
+
+`buildEmbeddedRunPayloads()` 将 Agent 运行结果转换为用户可见的回复载荷：
+
+```mermaid
+flowchart TD
+    RES[Agent 运行结果] --> ERR{lastAssistant.stopReason === error?}
+    ERR -->|是| ERRT["formatAssistantErrorText()"]
+    ERR -->|否| TOOL_ERR["resolveToolErrorWarningPolicy()"]
+    TOOL_ERR --> REASON{reasoningLevel === on?}
+    REASON -->|是| THINK["formatReasoningMessage(\nextractAssistantThinking())"]
+    REASON -->|否| PARSE["parseReplyDirectives()\n→ replyToId, media, etc."]
+    ERRT --> OUT[Reply Payloads]
+    THINK --> OUT
+    PARSE --> OUT
+```
+
+**Tool Error Warning Policy**（`resolveToolErrorWarningPolicy()`）：
+- Mutating tools（文件写入等）的错误**始终**向用户展示
+- `exec`/`bash` 错误默认抑制（除非 verbose 模式）
+- `sessions_send` 错误始终抑制（避免循环错误通知）
+
+**特殊处理**：
+- `suppressAssistantArtifacts`：当触发了 deterministic approval prompt 时，不展示 assistant 文本
+- `ANTHROPIC_MAGIC_STRING_TRIGGER_REFUSAL`：从 prompt 中清洗 Anthropic 的 refusal 触发字符串，避免 transcript 污染
+
+---
+
+## 错误处理与恢复
+
+### 错误分类
+
+| 错误类型 | 检测方式 | 恢复策略 |
+|----------|----------|----------|
+| Context overflow | `isLikelyContextOverflowError()` | compact (最多3次) → truncate tool results |
+| Auth 错误 | auth error 类型 | advanceAuthProfile → FailoverError |
+| Rate limit | rate_limit 错误 | advanceAuthProfile + backoff |
+| Billing 错误 | billing 错误 | advanceAuthProfile |
+| Overload | overloaded 错误 | backoff (250ms-1.5s) → failover |
+| Timeout | 超时 | 返回超时错误消息 |
+| Thinking 不支持 | unsupported thinking | `pickFallbackThinkingLevel()` 降级 |
+| Role ordering | 消息顺序冲突 | 返回 "Message ordering conflict" |
+| Image size | 图片过大 | 返回 "Image too large for the model" |
+| Retry limit | 超出最大重试 | 返回 "Request failed after repeated internal retries" |
+
+### 用户可见的错误消息
+
+- `context_overflow` / `compaction_failure` → 建议使用 `/reset` 或切换更大模型
+- `role_ordering` → "Message ordering conflict"
+- `image_size` → "Image too large for the model"
+- `retry_limit` → "Request failed after repeated internal retries"
+- 无回复超时 → "Request timed out before a response was generated"
+
+---
+
+## 生命周期状态机
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Idle: 启动
+    [*] --> Idle
+    Idle --> EnqueueLane: 收到请求
+    EnqueueLane --> ResolveHooks: before_model_resolve
+    ResolveHooks --> ResolveModel: 解析模型和 auth
+    ResolveModel --> ContextGuard: 评估上下文窗口
+    ContextGuard --> Attempt: 执行 attempt
     
-    Idle --> Initializing: 接收请求
-    Initializing --> Preparing: 加载配置
-    Preparing --> BuildingPrompt: 构建提示词
-    BuildingPrompt --> LoadingHistory: 加载历史
-    
-    LoadingHistory --> CallingLLM: 开始对话
-    CallingLLM --> Processing: 处理响应
-    
-    Processing --> HasTools: 有工具调用?
-    HasTools -->|是| Executing: 执行工具
-    Executing --> CallingLLM: 继续对话
-    
-    HasTools -->|否| Compacting: 需要压缩?
-    Compacting -->|是| Compacting: 压缩上下文
-    Compacting --> Idle
-    
-    Compacting -->|否| Returning: 返回结果
-    Returning --> [*]: 完成
-    
-    Processing --> Error: 发生错误
-    Error --> Idle: 重试
-    Error --> [*]: 失败
-```
-
-### 状态转换
-
-```typescript
-// 状态枚举
-enum AgentLoopState {
-  IDLE = "idle",
-  INITIALIZING = "initializing",
-  PREPARING = "preparing",
-  BUILDING_PROMPT = "building_prompt",
-  LOADING_HISTORY = "loading_history",
-  CALLING_LLM = "calling_llm",
-  PROCESSING = "processing",
-  EXECUTING = "executing",
-  COMPACTING = "compacting",
-  RETURNING = "returning",
-  ERROR = "error",
-}
-
-// 状态机
-class AgentLoopStateMachine {
-  private currentState: AgentLoopState = AgentLoopState.IDLE;
-  
-  transition(event: AgentLoopEvent): void {
-    switch (this.currentState) {
-      case AgentLoopState.IDLE:
-        if (event === "REQUEST") {
-          this.currentState = AgentLoopState.INITIALIZING;
-        }
-        break;
-      // ... 其他转换
+    state Attempt {
+        [*] --> Sandbox: resolveSandboxContext
+        Sandbox --> Skills: 加载 Skills
+        Skills --> Bootstrap: 加载 Bootstrap
+        Bootstrap --> Tools: 创建工具
+        Tools --> SessionInit: 初始化 SessionManager
+        SessionInit --> BuildPrompt: 构建 System Prompt
+        BuildPrompt --> InstallGuard: 安装 Context Guard
+        InstallGuard --> Subscribe: 订阅流式事件
+        Subscribe --> RegisterRun: 注册活跃运行
+        RegisterRun --> CallLLM: activeSession.prompt()
+        CallLLM --> WaitCompaction: 等待 compaction retry (60s)
+        WaitCompaction --> AfterTurn: contextEngine.afterTurn()
+        AfterTurn --> [*]
     }
-  }
-}
+    
+    Attempt --> Success: 返回结果
+    Attempt --> ContextOverflow: overflow 错误
+    Attempt --> AuthError: auth/rate-limit
+    
+    ContextOverflow --> Compact: contextEngine.compact
+    Compact --> Attempt: 重试
+    Compact --> TruncateTools: compact 失败
+    TruncateTools --> Attempt: 重试
+    
+    AuthError --> RotateAuth: advanceAuthProfile
+    RotateAuth --> Attempt: 重试
+    AuthError --> Failover: FailoverError
+    
+    Success --> [*]
+    Failover --> [*]
 ```
 
 ---
 
-## Mermaid 流程图
+## 关键常量参考
 
-### 完整消息处理流程
-
-```mermaid
-flowchart TD
-    subgraph "1. 接收阶段"
-        A1[接收消息] --> A2[解析参数]
-        A2 --> A3[验证会话]
-    end
-    
-    subgraph "2. 准备阶段"
-        B1[加载配置] --> B2[解析模型]
-        B2 --> B3[检查认证]
-        B3 --> B4[准备工作区]
-    end
-    
-    subgraph "3. 构建阶段"
-        C1[构建系统提示词] --> C2[加载引导文件]
-        C2 --> C3[合并 Skills]
-        C3 --> C4[准备工具定义]
-    end
-    
-    subgraph "4. 执行循环"
-        D1[发送用户消息] --> D2[调用 LLM]
-        D2 --> D3{有工具?}
-        D3 -->|是| D4[执行工具]
-        D4 --> D2
-        D3 -->|否| D5[生成回复]
-    end
-    
-    subgraph "5. 完成阶段"
-        E1[压缩上下文] --> E2[保存会话]
-        E2 --> E3[返回结果]
-    end
-    
-    A3 --> B1
-    B4 --> C1
-    C4 --> D1
-    D5 --> E1
-```
-
-### 错误恢复流程
-
-```mermaid
-flowchart TD
-    A[发生错误] --> B{错误类型?}
-    
-    B -->|上下文溢出| C[压缩]
-    C --> D{成功?}
-    D -->|是| E[重试]
-    D -->|否| F[返回错误]
-    
-    B -->|认证失败| G[切换认证]
-    G --> H{成功?}
-    H -->|是| E
-    H -->|否| F
-    
-    B -->|速率限制| I[等待]
-    I --> J{超时?}
-    J -->|否| E
-    J -->|是| F
-    
-    B -->|其他| K[记录日志]
-    K --> F
-```
-
-### 上下文管理流程
-
-```mermaid
-flowchart LR
-    A[新消息] --> B[添加到历史]
-    B --> C[计算令牌数]
-    C --> D{超过阈值?}
-    D -->|否| E[直接使用]
-    D -->|是| F[估算压缩]
-    F --> G{可压缩?}
-    G -->|是| H[执行压缩]
-    G -->|否| I[丢弃旧历史]
-    H --> E
-    I --> E
-    E --> J[LLM 调用]
-```
-
----
-
-## 源码关键代码解读
-
-### 1. 主运行入口
-
-```typescript
-// run.ts
-
-export async function runEmbeddedPiAgent(
-  params: RunEmbeddedPiAgentParams,
-): Promise<EmbeddedPiRunResult> {
-  const started = Date.now();
-  
-  // 1. 解析执行通道（支持优先级队列）
-  const sessionLane = resolveSessionLane(params.sessionKey || params.sessionId);
-  const globalLane = resolveGlobalLane(params.lane);
-  
-  return enqueueSession(() =>
-    enqueueGlobal(async () => {
-      try {
-        // 2. 准备工作区
-        const workspace = resolveRunWorkspaceDir({
-          workspaceDir: params.workspaceDir,
-          sessionKey: params.sessionKey,
-          agentId: params.agentId,
-        });
-        
-        // 3. 解析模型配置
-        const { model, authStorage } = await resolveModel({
-          provider: params.provider,
-          modelId: params.model,
-          agentDir: params.agentDir,
-        });
-        
-        // 4. 执行
-        const result = await runEmbeddedAttempt({
-          ...params,
-          model,
-          authStorage,
-          workspaceDir: workspace.workspaceDir,
-        });
-        
-        // 5. 记录指标
-        logRunMetrics({
-          runId: params.runId,
-          duration: Date.now() - started,
-          result,
-        });
-        
-        return result;
-      } catch (error) {
-        return handleRunError(error);
-      }
-    })
-  );
-}
-```
-
-### 2. 执行尝试循环
-
-```typescript
-// run/attempt.ts
-
-export async function runEmbeddedAttempt(params): Promise<EmbeddedRunAttemptResult> {
-  const { sessionManager, tools } = params;
-  
-  // 注册运行状态
-  const handle = registerRun({
-    sessionId: params.sessionId,
-    sessionManager,
-  });
-  
-  try {
-    // 发送用户消息
-    await sessionManager.appendUserMessage(params.message);
-    
-    // 主循环
-    let iterations = 0;
-    const maxIterations = params.maxIterations ?? 20;
-    
-    while (iterations < maxIterations) {
-      iterations++;
-      
-      // 调用 LLM
-      const response = await sessionManager.complete({
-        model: params.modelId,
-        tools,
-        thinking: params.thinkLevel,
-        
-        onChunk: (chunk) => {
-          // 流式处理
-          handleStreamingChunk(chunk);
-        },
-      });
-      
-      // 检查工具调用
-      if (response.tool_calls?.length > 0) {
-        // 执行所有工具调用
-        for (const toolCall of response.tool_calls) {
-          const result = await executeTool({
-            name: toolCall.name,
-            arguments: toolCall.arguments,
-          });
-          
-          // 添加工具结果
-          await sessionManager.appendToolResult({
-            callId: toolCall.id,
-            name: toolCall.name,
-            content: result,
-          });
-        }
-        
-        continue;  // 继续循环
-      }
-      
-      // 完成
-      return {
-        success: true,
-        reply: response.content,
-        usage: response.usage,
-      };
-    }
-    
-    // 超出最大迭代次数
-    return {
-      success: false,
-      error: "Max iterations exceeded",
-    };
-  } finally {
-    unregisterRun(params.sessionId);
-  }
-}
-```
-
-### 3. 会话压缩
-
-```typescript
-// compact.ts
-
-export async function compactEmbeddedPiSession(params): Promise<EmbeddedPiCompactResult> {
-  const { sessionManager, config } = params;
-  
-  // 1. 检查是否需要压缩
-  const needsCompaction = await sessionManager.needsCompaction();
-  if (!needsCompaction) {
-    return { ok: true, compacted: false };
-  }
-  
-  // 2. 获取压缩估算
-  const estimate = await sessionManager.compactionEstimate();
-  
-  // 3. 执行压缩
-  const result = await sessionManager.compact({
-    systemPrompt: buildSystemPrompt(),
-    reserveTokens: resolveCompactionReserveTokensFloor(config),
-    
-    // 压缩策略
-    strategy: "summarize",  // 总结模式
-    targetTokens: estimate.targetTokens,
-  });
-  
-  if (result.success) {
-    return {
-      ok: true,
-      compacted: true,
-      originalTokens: estimate.originalTokens,
-      compactedTokens: result.tokenCount,
-    };
-  }
-  
-  return {
-    ok: false,
-    compacted: false,
-    reason: result.error,
-  };
-}
-```
-
-### 4. 工具执行
-
-```typescript
-// 工具执行逻辑
-async function executeTool(params) {
-  const { name, arguments } = params;
-  
-  // 1. 查找工具定义
-  const toolDef = findToolDefinition(name);
-  if (!toolDef) {
-    return { error: `Unknown tool: ${name}` };
-  }
-  
-  // 2. 验证参数
-  const validation = validateParameters(toolDef.schema, arguments);
-  if (!validation.valid) {
-    return { error: validation.error };
-  }
-  
-  // 3. 检查策略
-  const policyCheck = await checkToolPolicy({
-    toolName: name,
-    arguments,
-  });
-  if (!policyCheck.allowed) {
-    return { error: policyCheck.reason };
-  }
-  
-  // 4. 执行工具
-  try {
-    const result = await toolDef.handler(arguments);
-    return { success: true, result };
-  } catch (error) {
-    return { error: error.message };
-  }
-}
-```
-
-### 5. 错误分类
-
-```typescript
-// 错误分类和恢复
-function classifyError(error: Error): ErrorCategory {
-  const message = error.message;
-  
-  if (message.includes("context_length_exceeded")) {
-    return "CONTEXT_OVERFLOW";
-  }
-  
-  if (message.includes("rate_limit")) {
-    return "RATE_LIMIT";
-  }
-  
-  if (message.includes("authentication")) {
-    return "AUTH_ERROR";
-  }
-  
-  if (message.includes("timeout")) {
-    return "TIMEOUT";
-  }
-  
-  return "UNKNOWN";
-}
-
-// 错误恢复策略
-async function recoverFromError(
-  error: Error,
-  context: RunContext,
-): Promise<RecoveryResult> {
-  const category = classifyError(error);
-  
-  switch (category) {
-    case "CONTEXT_OVERFLOW":
-      // 尝试压缩
-      const compactResult = await compactSession(context);
-      if (compactResult.success) {
-        return { action: "retry", reason: "compacted" };
-      }
-      return { action: "fail", reason: "cannot_compact" };
-    
-    case "RATE_LIMIT":
-      // 等待后重试
-      await sleep(getRetryDelay(error));
-      return { action: "retry", reason: "rate_limited" };
-    
-    case "AUTH_ERROR":
-      // 尝试切换认证
-      const failoverResult = await attemptAuthFailover(context);
-      if (failoverResult.success) {
-        return { action: "retry", reason: "auth_failover" };
-      }
-      return { action: "fail", reason: "auth_failed" };
-    
-    default:
-      return { action: "fail", reason: error.message };
-  }
-}
-```
+| 常量 | 值 | 说明 |
+|------|-----|------|
+| `BASE_RUN_RETRY_ITERATIONS` | 24 | 基础重试次数 |
+| `RUN_RETRY_ITERATIONS_PER_PROFILE` | 8 | 每个 auth profile 额外重试次数 |
+| `MAX_RUN_LOOP_ITERATIONS` | 32-160 | 最大循环次数（24 + 8*profiles，下限32，上限160） |
+| `MAX_OVERFLOW_COMPACTION_ATTEMPTS` | 3 | 最大 overflow compact 尝试次数 |
+| `CONTEXT_WINDOW_HARD_MIN_TOKENS` | 16,000 | 上下文窗口绝对下限 |
+| `CONTEXT_WINDOW_WARN_BELOW_TOKENS` | 32,000 | 上下文窗口警告阈值 |
+| `MAX_TOOL_RESULT_CONTEXT_SHARE` | 0.3 | 单个工具结果最大上下文占比 |
+| `HARD_MAX_TOOL_RESULT_CHARS` | 400,000 | 单个工具结果绝对字符上限 |
+| Compaction retry timeout | 60s | `waitForCompactionRetryWithAggregateTimeout` |
+| Overload backoff | 250ms-1.5s | `OVERLOAD_FAILOVER_BACKOFF_POLICY` |
 
 ---
 
 ## 常见问题
 
-### Q1: Agent Loop 和普通对话有什么区别？
+### Q1: 为什么重试次数这么多（最多 160 次）？
 
-| 方面 | Agent Loop | 普通对话 |
-|------|-----------|---------|
-| **工具调用** | 支持自动调用工具 | 仅文本交互 |
-| **迭代** | 循环直到无工具调用 | 单轮响应 |
-| **上下文** | 自动压缩管理 | 手动管理 |
-| **流式** | 支持增量响应 | 等待完整响应 |
+这不是 160 次 LLM 调用。`MAX_RUN_LOOP_ITERATIONS` 是**外层循环**的最大次数，包含了 auth profile 轮转、compact 重试、backoff 等待等。实际 LLM 调用次数取决于工具调用循环，外层循环更多是处理瞬时错误恢复。`24 + 8 * profiles` 的设计确保每个 auth profile 都有足够的重试机会。
 
-### Q2: 如何限制循环次数？
+### Q2: Auth Profile 轮转和模型 Fallback 是什么关系？
 
-```typescript
-// 配置最大迭代次数
-await runEmbeddedPiAgent({
-  message: "...",
-  maxIterations: 10,  // 最多 10 轮（LLM 调用）
-});
-```
+Auth Profile 轮转在**同一模型**内切换不同的 API key/认证。当所有 profile 都耗尽后，如果配置了 `modelFallbacks`，会抛出 `FailoverError`，由上层切换到备选模型重新执行。这是两层 failover 机制。
 
-### Q3: 上下文压缩会影响质量吗？
+### Q3: Context Overflow 恢复的三次 compact 之间有什么区别？
 
-压缩策略：
-- **summarize**: 总结旧消息，保留关键信息
-- **truncate**: 截断超长消息
-- **hybrid**: 结合总结和截断
+三次尝试使用相同的 `contextEngine.compact()` 方法，但每次之后上下文会变小。如果连续三次 compact 后仍然 overflow，说明问题不在历史长度而在于某些超大的工具结果，此时降级到 `truncateOversizedToolResultsInSession()` 强制截断。
 
-```typescript
-// 配置压缩策略
-{
-  agents: {
-    defaults: {
-      compaction: {
-        strategy: "summarize",
-        reserveTokens: 2000,
-      },
-    },
-  },
-}
-```
+### Q4: Probe session 有什么特殊处理？
 
-### Q4: 如何调试循环过程？
+以 `probe-` 开头的 sessionId 被视为探测会话：
+- 减少日志输出
+- 不发出超时警告
+- 用于系统内部的健康检查和模型可用性探测
 
-```typescript
-// 启用调试日志
-log.setLevel("debug");
+### Q5: sessions_yield 什么时候会触发？
 
-// 查看详细执行流程
-await runEmbeddedPiAgent({
-  message: "...",
-  debug: {
-    logSteps: true,
-    logTools: true,
-    logPrompt: true,
-  },
-});
-```
+当 Agent 运行中调用 `sessions_yield` 工具时，表示"我完成了当前阶段，让出控制权"。这在 subagent 场景中常见，子 agent 完成部分任务后通过 yield 通知主 agent。yield 被视为 clean stop，不会触发错误恢复。
 
-### Q5: 工具调用失败会怎样？
+### Q6: UsageAccumulator 为什么只取最后一次 API 调用的 cache 数据？
 
-```mermaid
-flowchart TD
-    A[工具调用失败] --> B{错误类型?}
-    B -->|可恢复| C[重试]
-    B -->|致命| D[返回错误结果]
-    
-    C --> E{重试次数?}
-    E -->|是| F[等待后重试]
-    F --> A
-    E -->|否| D
-```
-
-### Q6: 如何处理长时间运行的任务？
-
-```typescript
-// 设置超时
-await runEmbeddedPiAgent({
-  message: "分析这个大型项目",
-  timeoutMs: 300000,  // 5 分钟超时
-});
-
-// 或者使用后台执行
-await sessions_spawn({
-  task: "深度分析代码库",
-  runTimeoutSeconds: 1800,  // 30 分钟
-  cleanup: "keep",  // 保留结果
-});
-```
-
-### Q7: 流式响应如何工作？
-
-```typescript
-// 启用流式
-await runEmbeddedPiAgent({
-  message: "写一篇长文章",
-  streaming: true,
-  
-  onChunk: (chunk) => {
-    // 实时接收增量内容
-    process.stdout.write(chunk.content);
-  },
-  
-  onComplete: (result) => {
-    // 完成后处理
-    console.log("\n完成!");
-  },
-});
-```
-
-### Q8: 如何自定义工具策略？
-
-```yaml
-# openclaw.yaml
-tools:
-  sandbox:
-    tools:
-      allow:
-        - read
-        - write
-        - exec
-      deny:
-        - dangerous_command
-```
+`lastCacheRead`/`lastCacheWrite` 只取最后一次 API 调用的值，而非累加。这是因为 cache 数据代表的是当前上下文快照的缓存命中情况，累加会严重高估实际 cache 使用量。
 
 ---
 
-## 总结
-
-OpenClaw Agent Loop 机制核心要点：
-
-### 架构设计
-
-1. **模块化** - 分离运行、尝试、压缩等功能
-2. **状态管理** - 跟踪运行状态和等待者
-3. **错误恢复** - 多种错误类型对应不同恢复策略
-4. **上下文优化** - 自动压缩避免超出窗口限制
-
-### 关键流程
-
-```mermaid
-graph LR
-    A[消息] --> B[构建提示词]
-    B --> C[LLM 调用]
-    C --> D{工具?}
-    D -->|是| E[执行工具]
-    E --> C
-    D -->|否| F[返回结果]
-    F --> G[压缩]
-    G --> A
-```
-
-### 最佳实践
-
-1. **合理设置超时** - 避免长时间阻塞
-2. **配置压缩策略** - 根据需求选择总结或截断
-3. **工具白名单** - 只暴露必要的工具
-4. **监控执行** - 使用日志追踪执行流程
-
-掌握这些概念，就能深入理解并高效使用 OpenClaw 的 Agent Loop 机制！
+*基于 OpenClaw v2026.2.3-1 源码 `src/agents/pi-embedded-runner/` 分析*

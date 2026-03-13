@@ -1,34 +1,58 @@
-# OpenClaw 核心数据结构
+# OpenClaw 核心数据结构源码深度分析
 
 ## 概述
 
-OpenClaw 是一个多平台 AI 助手框架，支持跨多个通信平台（如 Discord、Telegram、Slack、iMessage 等）的统一对话体验。系统采用模块化架构设计，核心组件包括消息系统、会话系统、Agent 系统、工具系统、通道系统、记忆系统和 Gateway 服务。
+OpenClaw 是一个多平台 AI 助手框架，支持跨 22+ 通信平台（Discord、Telegram、Slack、iMessage、WhatsApp 等）的统一对话体验。系统采用模块化架构，核心组件涵盖消息系统、会话系统、Agent 系统、工具系统、通道系统、记忆系统、上下文引擎和 Gateway 服务。
 
-本文档详细分析 OpenClaw 的核心数据结构及其相互关系。
+本文档基于源码进行深度分析，覆盖所有核心数据结构及其相互关系。
+
+---
+
+## 设计理念
+
+OpenClaw 在类型系统上采用**双轨验证策略**：
+
+| 维度 | 技术选型 | 适用场景 | 原因 |
+|------|---------|---------|------|
+| **协议/工具类型** | TypeBox (`@sinclair/typebox`) | Agent 工具 input_schema、消息协议 | 生成标准 JSON Schema，兼容 LLM function calling |
+| **配置验证** | Zod | 用户配置文件、环境变量 | 运行时验证 + 友好错误提示 |
+| **运行时类型** | TypeScript interfaces | 内存数据结构 | 零运行时开销 |
+
+另一个关键设计原则是**运行时（in-memory）与持久化（file/DB）结构的分离**：
+
+- **运行时结构**：会话消息缓冲、Agent 运行状态、通道连接状态、工具调用缓存——随进程生命周期存在
+- **持久化结构**：会话 JSON 文件、SQLite 记忆索引、认证配置、Gateway 会话行——跨重启保留
+
+这种分离确保热路径上无序列化开销，同时保证数据的持久性。
 
 ---
 
 ## 1. 消息系统
 
-### 1.1 消息类型定义
+### 1.1 核心消息类型
 
 ```mermaid
 classDiagram
-    class ChannelMessageActionName {
-        <<type alias>>
-    }
-    
     class AgentMessage {
         <<interface>>
         +role: "user" | "assistant" | "tool" | "system"
-        +content: string | array
+        +content: string | ContentBlock[]
         +tool_call_id?: string
         +tool_name?: string
         +tool_use_id?: string
         +is_antthinking?: boolean
         +timestamp?: number
     }
-    
+
+    class ContentBlock {
+        <<interface>>
+        +type: "text" | "image" | "tool_use" | "tool_result"
+        +text?: string
+        +media_url?: string
+        +tool_use?: ToolUseBlock
+        +tool_result?: ToolResultBlock
+    }
+
     class ReplyPayload {
         <<interface>>
         +text?: string
@@ -36,7 +60,7 @@ classDiagram
         +action?: ChannelMessageActionName
         +replyTo?: string
     }
-    
+
     class ChannelOutboundContext {
         <<interface>>
         +cfg: OpenClawConfig
@@ -48,33 +72,43 @@ classDiagram
         +threadId?: string | number | null
         +accountId?: string | null
     }
+
+    class ChannelMessageActionName {
+        <<enumeration>>
+        reaction
+        edit
+        unsend
+        reply
+        thread
+    }
+
+    AgentMessage --> ContentBlock : content 可为数组
+    ReplyPayload --> ChannelMessageActionName : action
+    ChannelOutboundContext ..> ReplyPayload : 由 ReplyPayload 构建
 ```
 
 ### 1.2 消息状态流转
 
+消息从创建到最终送达，经历以下状态机：
+
 ```mermaid
 stateDiagram-v2
     [*] --> Created: 新消息创建
-    
-    Created --> Queued: 加入发送队列
-    Queued --> Processing: 开始处理
-    
-    Processing --> Sending: 执行发送
-    Sending --> Sent: 发送成功
-    
-    Processing --> Error: 发送失败
-    Error --> Queued: 重试队列
-    
-    Sent --> Delivered: 确认送达
+    Created --> Queued: 加入 PiQueue 发送队列
+    Queued --> Processing: EmbeddedPiQueueHandle 拉取
+    Processing --> Streaming: isStreaming() = true
+    Streaming --> Sending: 流式输出完成
+    Sending --> Sent: 通道适配器确认
+    Processing --> Error: 执行异常
+    Error --> Queued: 自动重试
+    Sent --> Delivered: 平台回执确认
     Delivered --> [*]
-    
-    Error --> [*]: 永久失败
+    Error --> [*]: 超过重试上限
 ```
 
 ### 1.3 通道消息格式
 
 ```typescript
-// 核心消息类型定义
 interface ChannelMessage {
   channel: ChannelId;
   from: string;
@@ -104,66 +138,99 @@ interface ChannelMedia {
 ```mermaid
 classDiagram
     class GatewaySessionRow {
-        <<interface>>
+        <<interface / 持久化>>
         +key: string
         +kind: "direct" | "group" | "global" | "unknown"
         +label?: string
         +displayName?: string
+        +derivedTitle?: string
+        +lastMessagePreview?: string
         +channel?: string
         +subject?: string
+        +groupChannel?: string
+        +space?: string
+        +chatType?: NormalizedChatType
+        +origin?: SessionEntry.origin
         +updatedAt: number | null
-        +modelProvider?: string
-        +model?: string
+        +sessionId?: string
+        +systemSent?: boolean
+        +abortedLastRun?: boolean
         +thinkingLevel?: string
         +verboseLevel?: string
+        +reasoningLevel?: string
+        +elevatedLevel?: string
         +sendPolicy?: "allow" | "deny"
+        +inputTokens?: number
+        +outputTokens?: number
+        +totalTokens?: number
+        +responseUsage?: "on" | "off" | "tokens" | "full"
+        +modelProvider?: string
+        +model?: string
+        +contextTokens?: number
+        +deliveryContext?: DeliveryContext
+        +lastChannel?: string
+        +lastTo?: string
+        +lastAccountId?: string
     }
-    
+
     class SessionEntry {
-        <<interface>>
+        <<interface / 配置>>
         +key: string
         +origin?: string
         +lastChannel?: string
         +lastTo?: string
         +lastAccountId?: string
     }
-    
+
     class SessionPreviewItem {
         <<interface>>
         +role: "user" | "assistant" | "tool" | "system" | "other"
         +text: string
     }
+
+    class SessionsPreviewEntry {
+        <<interface>>
+        +key: string
+        +status: "ok" | "empty" | "missing" | "error"
+        +items: SessionPreviewItem[]
+    }
+
+    GatewaySessionRow --> SessionEntry : 引用 origin/lastChannel
+    SessionsPreviewEntry --> SessionPreviewItem : 包含
 ```
 
 ### 2.2 会话生命周期
 
 ```mermaid
 flowchart TD
-    A[会话创建] --> B{会话类型}
-    B -->|主会话| C[初始化 Agent]
-    B -->|独立会话| D[独立 Agent 上下文]
-    
-    C --> E[加载系统提示词]
-    D --> E
-    E --> F[加载历史消息]
-    F --> G[工具调用循环]
-    
-    G --> H{需要工具?}
-    H -->|是| I[执行工具]
-    I --> J[保存结果]
-    J --> G
-    H -->|否| K[返回响应]
-    
-    K --> L[压缩上下文]
-    L --> M[检查终止条件]
-    M -->|继续| F
-    M -->|结束| N[会话结束]
+    A[消息到达] --> B{会话存在?}
+    B -->|否| C[创建 GatewaySessionRow]
+    B -->|是| D[加载 SessionEntry]
+    C --> D
+
+    D --> E[解析 Agent 配置]
+    E --> F[ContextEngine.bootstrap]
+    F --> G[加载历史消息]
+    G --> H[ContextEngine.assemble 构建上下文]
+
+    H --> I[LLM 调用]
+    I --> J{需要工具?}
+    J -->|是| K[执行工具调用]
+    K --> L[ContextEngine.ingest 工具结果]
+    L --> I
+    J -->|否| M[返回响应]
+
+    M --> N[ContextEngine.afterTurn]
+    N --> O{上下文超限?}
+    O -->|是| P[ContextEngine.compact 压缩]
+    P --> Q[更新 GatewaySessionRow]
+    O -->|否| Q
+    Q --> R[会话空闲/结束]
 ```
 
-### 2.3 主会话 vs 独立会话
+### 2.3 主会话 vs 子代理会话
 
 ```typescript
-// 会话相关类型
 type SessionKey = string;
 type SessionType = "main" | "subagent";
 
@@ -171,19 +238,11 @@ interface SessionContext {
   sessionKey: SessionKey;
   type: SessionType;
   agentId: string;
-  parentSessionKey?: string;
+  parentSessionKey?: string;   // 子代理指向父会话
   workspaceDir: string;
   model?: string;
   thinkingLevel?: "off" | "low" | "high";
   verboseLevel?: "off" | "low" | "high";
-}
-
-interface SubagentSpawnParams {
-  agentId: string;
-  sessionKey?: string;
-  model?: string;
-  message?: string;
-  announce?: boolean;
 }
 ```
 
@@ -195,14 +254,6 @@ interface SubagentSpawnParams {
 
 ```mermaid
 classDiagram
-    class AgentTool {
-        <<interface>>
-        +name: string
-        +description: string
-        +input_schema: TSchema
-        +output_schema?: TSchema
-    }
-    
     class AgentConfig {
         <<interface>>
         +id: string
@@ -214,7 +265,7 @@ classDiagram
         +contextTokens?: number
         +thinking?: string
     }
-    
+
     class AgentIdentity {
         <<interface>>
         +name?: string
@@ -223,36 +274,48 @@ classDiagram
         +avatar?: string
         +avatarUrl?: string
     }
+
+    class AgentTool {
+        <<interface / TypeBox>>
+        +name: string
+        +description: string
+        +input_schema: TSchema
+        +output_schema?: TSchema
+    }
+
+    AgentConfig --> AgentIdentity : identity
+    AgentConfig ..> AgentTool : 注册工具列表
 ```
+
+> **TypeBox 在此处的作用**：`AgentTool.input_schema` 使用 TypeBox 的 `TSchema` 类型，编译期生成标准 JSON Schema，直接传递给 LLM 的 function calling 接口，无需额外转换。
 
 ### 3.2 工具调用链路
 
 ```mermaid
 sequenceDiagram
-    participant A as Agent
-    participant T as ToolManager
+    participant LLM as LLM Provider
+    participant A as Agent Runtime
     participant P as PolicyGuard
-    participant E as Executor
-    
-    A->>T: 调用工具 (name, params)
-    T->>P: 检查调用策略
-    P->>P: 验证参数
-    P-->>T: 验证结果
-    
+    participant T as ToolExecutor
+
+    LLM->>A: tool_use (name, params)
+    A->>P: 检查 ToolPolicy (allow/deny)
+    P->>P: 展开 group:* 分组
+    P-->>A: 通过/拒绝
+
     alt 允许调用
-        T->>E: 执行工具
-        E-->>T: 执行结果
-        T->>T: 格式化结果
-        T-->>A: 返回结果
+        A->>T: 执行工具 (name, params, context)
+        T->>T: TypeBox schema 验证参数
+        T-->>A: AgentToolResult
+        A->>LLM: tool_result
     else 拒绝调用
-        T-->>A: 抛出策略错误
+        A-->>LLM: 策略错误信息
     end
 ```
 
 ### 3.3 上下文窗口管理
 
 ```typescript
-// Agent 相关类型
 interface ContextWindowConfig {
   maxTokens: number;
   warningThreshold: number;
@@ -265,16 +328,6 @@ interface CompactionResult {
   compactedCount: number;
   preservedCount: number;
 }
-
-interface ToolCallRecord {
-  callId: string;
-  toolName: string;
-  params: Record<string, unknown>;
-  startTime: number;
-  endTime?: number;
-  result?: unknown;
-  error?: string;
-}
 ```
 
 ---
@@ -285,16 +338,6 @@ interface ToolCallRecord {
 
 ```mermaid
 classDiagram
-    class ChannelAgentTool {
-        <<type alias>>
-        +AgentTool~TSchema, unknown~
-    }
-    
-    class AnyAgentTool {
-        <<type alias>>
-        +AgentTool~any, unknown~
-    }
-    
     class ToolDefinition {
         <<interface>>
         +name: string
@@ -303,62 +346,70 @@ classDiagram
         +output_schema?: Record~string, unknown~
         +annotations?: Record~string, unknown~
     }
-    
+
     class ToolPolicy {
         <<interface>>
         +allow?: string[]
         +deny?: string[]
     }
+
+    class ToolProfilePolicy {
+        <<interface>>
+        +allow?: string[]
+        +deny?: string[]
+    }
+
+    class SandboxToolPolicyResolved {
+        <<interface>>
+        +allow: string[]
+        +deny: string[]
+        +sources: PolicySourcePair
+    }
+
+    ToolPolicy <|-- ToolProfilePolicy
+    ToolProfilePolicy --> SandboxToolPolicyResolved : 解析后
 ```
 
-### 4.2 工具执行流程
+### 4.2 工具 Profile 与分组
 
-```mermaid
-flowchart TD
-    A[工具调用请求] --> B[验证参数模式]
-    B --> C{参数有效?}
-    C -->|否| D[返回参数错误]
-    C -->|是| E[应用策略检查]
-    
-    E --> F{允许执行?}
-    F -->|否| G[记录拒绝日志]
-    G --> H[返回策略错误]
-    F -->|是| I[执行工具逻辑]
-    
-    I --> J{执行成功?}
-    J -->|否| K[捕获执行错误]
-    K --> L[格式化错误响应]
-    J -->|是| M[格式化结果]
-    
-    L --> N[记录工具调用历史]
-    M --> N
-    N --> O[返回结果]
-```
+OpenClaw 通过 **Profile** 和 **Group** 两级机制管理工具权限：
 
-### 4.3 工具策略配置
+| Profile ID | 包含的工具组 | 适用场景 |
+|-----------|------------|---------|
+| `minimal` | 基础对话工具 | 只需对话的轻量 Agent |
+| `coding` | `group:fs` + `group:runtime` + 基础 | 编码助手 |
+| `messaging` | `group:sessions` + `group:openclaw` + 基础 | 跨平台消息 Agent |
+| `full` | 全部工具组 | 完整能力 Agent |
 
 ```typescript
-// 工具系统类型
-type ToolProfileId = "minimal" | "coding" | "messaging" | "full";
-
-interface ToolProfilePolicy {
-  allow?: string[];
-  deny?: string[];
-}
-
-interface ToolInvocationPolicy {
-  userInvocable: boolean;
-  disableModelInvocation: boolean;
-}
-
 const TOOL_GROUPS: Record<string, string[]> = {
-  "group:memory": ["memory_search", "memory_get"],
-  "group:web": ["web_search", "web_fetch"],
-  "group:fs": ["read", "write", "edit", "apply_patch"],
-  "group:runtime": ["exec", "process"],
+  "group:memory":   ["memory_search", "memory_get"],
+  "group:web":      ["web_search", "web_fetch"],
+  "group:fs":       ["read", "write", "edit", "apply_patch"],
+  "group:runtime":  ["exec", "process"],
   "group:sessions": ["sessions_list", "sessions_history", "sessions_send"],
   "group:openclaw": ["browser", "canvas", "nodes", "message", "gateway"],
 };
+```
+
+### 4.3 工具执行流程
+
+```mermaid
+flowchart TD
+    A[工具调用请求] --> B[TypeBox Schema 验证参数]
+    B --> C{参数有效?}
+    C -->|否| D[返回验证错误]
+    C -->|是| E[展开 group:* → 具体工具名]
+    E --> F[ToolPolicy allow/deny 检查]
+    F --> G{允许执行?}
+    G -->|否| H[返回策略拒绝]
+    G -->|是| I[执行工具逻辑]
+    I --> J{执行成功?}
+    J -->|否| K[捕获异常 → 格式化错误]
+    J -->|是| L[格式化 AgentToolResult]
+    K --> M[记录 ToolCallRecord]
+    L --> M
+    M --> N[返回结果给 Agent]
 ```
 
 ---
@@ -371,16 +422,30 @@ const TOOL_GROUPS: Record<string, string[]> = {
 classDiagram
     class ChannelId {
         <<type alias>>
-        +string
+        string
     }
-    
+
     class ChannelConfig {
         <<interface>>
         +enabled: boolean
         +accountId: string
         +account?: ResolvedAccount
     }
-    
+
+    class ChannelMeta {
+        <<interface>>
+        +id: ChannelId
+        +label: string
+        +selectionLabel: string
+        +docsPath: string
+        +docsLabel?: string
+        +blurb: string
+        +order?: number
+        +aliases?: string[]
+        +systemImage?: string
+        +showConfigured?: boolean
+    }
+
     class ChannelAccountSnapshot {
         <<interface>>
         +accountId: string
@@ -390,19 +455,20 @@ classDiagram
         +linked?: boolean
         +running?: boolean
         +connected?: boolean
+        +reconnectAttempts?: number
+        +lastConnectedAt?: number | null
+        +lastDisconnect?: DisconnectInfo | null
+        +lastMessageAt?: number | null
         +lastError?: string | null
     }
-    
-    class ChannelMeta {
-        <<interface>>
-        +id: ChannelId
-        +label: string
-        +blurb: string
-        +docsPath: string
-    }
+
+    ChannelConfig --> ChannelMeta : 引用
+    ChannelConfig --> ChannelAccountSnapshot : 运行时状态
 ```
 
-### 5.2 通道适配器架构
+### 5.2 通道适配器架构 — ChannelPlugin
+
+`ChannelPlugin` 是所有通道适配器的统一接口，每个适配器实现其中的可选子适配器：
 
 ```mermaid
 classDiagram
@@ -416,48 +482,80 @@ classDiagram
         +status?: ChannelStatusAdapter
         +gateway?: ChannelGatewayAdapter
     }
-    
+
     class ChannelCapabilities {
         <<interface>>
-        +chatTypes: string[]
+        +chatTypes: Array~NormalizedChatType | "thread"~
         +polls?: boolean
         +reactions?: boolean
         +edit?: boolean
+        +unsend?: boolean
+        +reply?: boolean
+        +effects?: boolean
+        +groupManagement?: boolean
         +threads?: boolean
         +media?: boolean
+        +nativeCommands?: boolean
+        +blockStreaming?: boolean
     }
+
+    ChannelPlugin --> ChannelCapabilities : 声明能力
 ```
 
-### 5.3 消息路由机制
+### 5.3 全部 22 个通道适配器
+
+| # | 通道 ID | 平台 | 特殊能力 |
+|---|---------|------|---------|
+| 1 | `discord` | Discord | threads, reactions, media |
+| 2 | `telegram` | Telegram | edit, reply, media, polls |
+| 3 | `slack` | Slack | threads, reactions, edit |
+| 4 | `imessage` | iMessage | reactions, media |
+| 5 | `whatsapp` | WhatsApp | media, reactions |
+| 6 | `signal` | Signal | reactions, media |
+| 7 | `matrix` | Matrix | threads, edit, reactions |
+| 8 | `irc` | IRC | 基础文本 |
+| 9 | `xmpp` | XMPP | 基础文本 |
+| 10 | `twitter` | Twitter/X | reply, media |
+| 11 | `mastodon` | Mastodon | reply, media |
+| 12 | `bluesky` | Bluesky | reply |
+| 13 | `nostr` | Nostr | 去中心化消息 |
+| 14 | `email` | Email (SMTP/IMAP) | 富文本, 附件 |
+| 15 | `sms` | SMS (Twilio) | 基础文本 |
+| 16 | `line` | LINE | media, effects |
+| 17 | `wechat` | WeChat | media |
+| 18 | `teams` | Microsoft Teams | threads, media |
+| 19 | `webex` | Webex | threads |
+| 20 | `webhook` | Generic Webhook | 自定义 payload |
+| 21 | `rest` | REST API | 程序化接入 |
+| 22 | `websocket` | WebSocket | 实时双向通信 |
+
+### 5.4 消息路由机制
 
 ```mermaid
 flowchart TD
-    A[接收消息] --> B[解析通道类型]
-    B --> C[确定目标会话]
+    A[接收消息] --> B[ChannelPlugin.config 解析通道]
+    B --> C[确定目标 SessionKey]
     C --> D{会话存在?}
-    D -->|否| E[创建新会话]
-    D -->|是| F[加载会话上下文]
-    
+    D -->|否| E[创建 GatewaySessionRow]
+    D -->|是| F[加载 SessionEntry]
     E --> G[初始化 Agent]
     F --> G
-    G --> H[处理消息]
-    
-    H --> I[生成响应]
-    I --> J[路由到输出适配器]
-    
-    J --> K{使用 Gateway?}
-    K -->|是| L[Gateway 发送]
-    K -->|否| M[直接发送]
-    
-    L --> N[更新会话状态]
-    M --> N
+
+    G --> H[Agent 处理消息]
+    H --> I[生成 ReplyPayload]
+    I --> J{路由策略}
+    J -->|Gateway 模式| K[GatewayWsClient.socket.send]
+    J -->|直连模式| L[ChannelPlugin.outbound.send]
+
+    K --> M[更新 GatewaySessionRow]
+    L --> M
 ```
 
 ---
 
 ## 6. 记忆系统
 
-### 6.1 记忆存储结构
+### 6.1 记忆管理器接口
 
 ```mermaid
 classDiagram
@@ -468,7 +566,7 @@ classDiagram
         +status(): MemoryProviderStatus
         +sync(params?): Promise~void~
     }
-    
+
     class MemorySearchResult {
         <<interface>>
         +path: string
@@ -476,16 +574,22 @@ classDiagram
         +endLine: number
         +score: number
         +snippet: string
-        +source: MemorySource
+        +source: "memory" | "sessions"
     }
-    
-    class MemorySource {
-        <<type alias>>
-        +"memory" | "sessions"
+
+    class MemoryProviderStatus {
+        <<interface>>
+        +indexed: boolean
+        +fileCount: number
+        +chunkCount: number
+        +lastSyncAt?: number
     }
+
+    MemoryManager --> MemorySearchResult : search 返回
+    MemoryManager --> MemoryProviderStatus : status 返回
 ```
 
-### 6.2 数据库 Schema
+### 6.2 SQLite Schema（5 张表 + 1 虚拟表）
 
 ```mermaid
 erDiagram
@@ -493,7 +597,7 @@ erDiagram
         TEXT key PK
         TEXT value
     }
-    
+
     files {
         TEXT path PK
         TEXT source
@@ -501,7 +605,7 @@ erDiagram
         INTEGER mtime
         INTEGER size
     }
-    
+
     chunks {
         TEXT id PK
         TEXT path FK
@@ -514,7 +618,7 @@ erDiagram
         TEXT embedding
         INTEGER updated_at
     }
-    
+
     embedding_cache {
         TEXT provider PK
         TEXT model PK
@@ -524,41 +628,157 @@ erDiagram
         INTEGER dims
         INTEGER updated_at
     }
-    
-    files ||--o{ chunks : contains
+
+    chunks_vec {
+        TEXT id PK
+        BLOB embedding "sqlite-vec 向量列"
+        FLOAT distance "余弦距离"
+    }
+
+    chunks_fts {
+        TEXT text "FTS5 全文索引"
+        TEXT path
+    }
+
+    files ||--o{ chunks : "contains"
+    chunks ||--|| chunks_vec : "向量索引 1:1"
+    chunks ||--|| chunks_fts : "全文索引 1:1"
+    chunks ..> embedding_cache : "缓存向量"
 ```
+
+> **chunks_vec** 使用 `sqlite-vec` 扩展实现向量相似度搜索；**chunks_fts** 使用 SQLite FTS5 虚拟表实现关键词全文检索。混合检索时两者结果合并排序。
 
 ### 6.3 语义检索流程
 
 ```mermaid
 sequenceDiagram
-    participant U as User
+    participant U as 用户/Agent
     participant M as MemoryManager
     participant E as EmbeddingService
-    participant V as VectorDB
-    participant F as FileSystem
-    
+    participant V as chunks_vec (sqlite-vec)
+    participant F as chunks_fts (FTS5)
+
     U->>M: search(query, maxResults)
     M->>E: generateEmbedding(query)
     E-->>M: queryVector
-    
-    M->>V: similaritySearch(queryVector)
-    V-->>M: topKResults
-    
-    loop For each result
-        M->>F: readFile(relPath, lines)
-        F-->>M: fileContent
+
+    par 向量检索
+        M->>V: 余弦相似度搜索(queryVector, topK)
+        V-->>M: vecResults
+    and 全文检索
+        M->>F: FTS5 MATCH query
+        F-->>M: ftsResults
     end
-    
-    M->>M: formatSnippets
+
+    M->>M: 合并去重 + 重排序
     M-->>U: MemorySearchResult[]
 ```
 
 ---
 
-## 7. Gateway 核心结构
+## 7. 上下文引擎（ContextEngine）
 
-### 7.1 连接管理
+ContextEngine 是 OpenClaw v2026.2 新增的核心抽象，统一管理 Agent 每轮对话的上下文生命周期：
+
+```mermaid
+classDiagram
+    class ContextEngine {
+        <<interface>>
+        +bootstrap(): Promise~void~
+        +ingest(data: any): Promise~void~
+        +ingestBatch(items: any[]): Promise~void~
+        +assemble(): Promise~ContextPayload~
+        +compact(): Promise~void~
+        +afterTurn(): Promise~void~
+        +dispose(): Promise~void~
+    }
+
+    class ContextPayload {
+        <<interface>>
+        +messages: AgentMessage[]
+        +systemPrompt: string
+        +tools: AgentTool[]
+        +tokenCount: number
+    }
+
+    ContextEngine --> ContextPayload : assemble 输出
+```
+
+**方法调用时序**：
+
+```mermaid
+sequenceDiagram
+    participant S as Session
+    participant CE as ContextEngine
+    participant LLM as LLM Provider
+
+    S->>CE: bootstrap()
+    Note over CE: 加载持久化历史、系统提示词
+
+    loop 每轮对话
+        S->>CE: ingest(userMessage)
+        S->>CE: assemble()
+        CE-->>S: ContextPayload
+
+        S->>LLM: 发送 ContextPayload
+        LLM-->>S: response / tool_use
+
+        opt 工具调用
+            S->>CE: ingest(toolResult)
+            S->>CE: assemble()
+        end
+
+        S->>CE: afterTurn()
+        Note over CE: 持久化、统计 token
+
+        opt 上下文超限
+            S->>CE: compact()
+            Note over CE: 压缩早期消息
+        end
+    end
+
+    S->>CE: dispose()
+```
+
+---
+
+## 8. Gateway 核心结构
+
+### 8.1 GatewayWsClient（WebSocket 客户端）
+
+```mermaid
+classDiagram
+    class GatewayWsClient {
+        <<type>>
+        +socket: WebSocket
+        +connect: ConnectParams
+        +connId: string
+        +presenceKey?: string
+        +clientIp?: string
+        +canvasHostUrl?: string
+        +canvasCapability?: string
+        +canvasCapabilityExpiresAtMs?: number
+    }
+
+    class ConnectParams {
+        <<interface>>
+        +clientName: string
+        +clientDisplayName?: string
+        +mode: GatewayClientMode
+        +url?: string
+        +token?: string
+    }
+
+    class GatewayClientMode {
+        <<type alias>>
+        "live" | "polling" | "webhook"
+    }
+
+    GatewayWsClient --> ConnectParams : connect
+    ConnectParams --> GatewayClientMode : mode
+```
+
+### 8.2 GatewayClient / GatewayServer
 
 ```mermaid
 classDiagram
@@ -569,50 +789,33 @@ classDiagram
         +on(event, handler): void
         +close(): Promise~void~
     }
-    
+
     class GatewayServer {
         <<interface>>
         +start(port): Promise~void~
         +stop(): Promise~void~
         +broadcast(message): void
-        +getClients(): GatewayClient[]
+        +getClients(): GatewayWsClient[]
     }
-    
-    class GatewayAuth {
-        <<interface>>
-        +authenticate(token): Promise~boolean~
-        +authorize(scope): Promise~boolean~
-    }
+
+    GatewayServer --> GatewayWsClient : 管理多个连接
+    GatewayClient ..> GatewayServer : 连接到
 ```
 
-### 7.2 Gateway 消息路由
-
-```mermaid
-flowchart TD
-    A[Gateway 消息] --> B[验证认证令牌]
-    B --> C{认证成功?}
-    C -->|否| D[返回 401 错误]
-    C -->|是| E[解析消息类型]
-    
-    E --> F{消息类型}
-    F -->|agent_message| G[路由到 Agent]
-    F -->|tool_call| H[路由到工具执行器]
-    F -->|session_create| I[创建新会话]
-    F -->|session_update| J[更新会话状态]
-    F -->|memory_query| K[路由到记忆系统]
-    
-    G --> L[生成响应]
-    H --> M[执行工具]
-    M --> L
-    
-    L --> N[序列化响应]
-    N --> O[发送回客户端]
-```
-
-### 7.3 Gateway 连接状态
+### 8.3 Gateway 连接管理
 
 ```typescript
-// Gateway 核心类型
+type GatewayWsClient = {
+  socket: WebSocket;
+  connect: ConnectParams;
+  connId: string;
+  presenceKey?: string;
+  clientIp?: string;
+  canvasHostUrl?: string;
+  canvasCapability?: string;
+  canvasCapabilityExpiresAtMs?: number;
+};
+
 interface GatewayConnection {
   id: string;
   clientName: string;
@@ -624,525 +827,318 @@ interface GatewayConnection {
   lastActivityAt: number;
   status: "connecting" | "connected" | "disconnected" | "error";
 }
+```
 
-type GatewayClientMode = "live" | "polling" | "webhook";
+### 8.4 Gateway 消息路由
 
-interface GatewayClientConfig {
-  clientName: string;
-  url?: string;
-  token?: string;
-  timeoutMs?: number;
-  mode: GatewayClientMode;
+```mermaid
+flowchart TD
+    A[WebSocket 消息到达] --> B[验证 connId / token]
+    B --> C{认证成功?}
+    C -->|否| D[关闭连接 + 401]
+    C -->|是| E[解析消息类型]
+
+    E --> F{消息类型}
+    F -->|agent_message| G[路由到 Agent Session]
+    F -->|tool_call| H[路由到 ToolExecutor]
+    F -->|session_create| I[创建 GatewaySessionRow]
+    F -->|session_update| J[更新会话设置]
+    F -->|memory_query| K[路由到 MemoryManager]
+    F -->|canvas_event| L[Canvas 事件处理]
+
+    G --> M[EmbeddedPiQueueHandle.queueMessage]
+    M --> N[流式响应回 GatewayWsClient.socket]
+```
+
+---
+
+## 9. EmbeddedPiQueueHandle — 嵌入式消息队列
+
+`EmbeddedPiQueueHandle` 是 Agent 运行时与消息队列的桥接接口，控制消息的排队、流式输出和中断：
+
+```mermaid
+classDiagram
+    class EmbeddedPiQueueHandle {
+        <<interface>>
+        +queueMessage(text: string): void
+        +isStreaming(): boolean
+        +isCompacting(): boolean
+        +abort(): void
+    }
+
+    class EmbeddedRunState {
+        <<interface>>
+        +activeRuns: Map~string, EmbeddedPiQueueHandle~
+        +waiters: Map~string, Set~EmbeddedRunWaiter~~
+    }
+
+    class EmbeddedRunWaiter {
+        <<interface>>
+        +resolve: Function
+        +reject: Function
+        +timeout?: NodeJS.Timeout
+    }
+
+    EmbeddedRunState --> EmbeddedPiQueueHandle : activeRuns 持有
+    EmbeddedRunState --> EmbeddedRunWaiter : waiters 等待完成
+```
+
+**生命周期**：
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle: 创建
+    Idle --> Queued: queueMessage(text)
+    Queued --> Streaming: LLM 开始响应 (isStreaming=true)
+    Streaming --> Compacting: 触发压缩 (isCompacting=true)
+    Compacting --> Streaming: 压缩完成
+    Streaming --> Idle: 响应完成
+    Streaming --> Aborted: abort() 调用
+    Queued --> Aborted: abort() 调用
+    Aborted --> [*]
+```
+
+---
+
+## 10. SubagentRunRecord — 子代理运行记录
+
+```mermaid
+classDiagram
+    class SubagentRunRecord {
+        <<interface / 增强版>>
+        +runId: string
+        +childSessionKey: string
+        +requesterSessionKey: string
+        +task: string
+        +cleanup?: Function
+        +label?: string
+        +agentId: string
+        +model?: string
+        +createdAt: number
+        +startedAt?: number
+        +endedAt?: number
+        +outcome?: SubagentOutcome
+    }
+
+    class SubagentOutcome {
+        <<type>>
+        "success" | "error" | "aborted" | "timeout"
+    }
+
+    SubagentRunRecord --> SubagentOutcome : outcome
+```
+
+```typescript
+interface SubagentRunRecord {
+  runId: string;
+  childSessionKey: string;
+  requesterSessionKey: string;
+  task: string;
+  cleanup?: () => void;
+  label?: string;
+  agentId: string;
+  model?: string;
+  createdAt: number;
+  startedAt?: number;
+  endedAt?: number;
+  outcome?: "success" | "error" | "aborted" | "timeout";
 }
 ```
 
 ---
 
-## 8. 核心数据结构关系图
+## 11. 插件系统 — PluginManifestRecord
 
 ```mermaid
-erDiagram
-    Agent ||--o{ Session : manages
-    Session ||--o{ Message : contains
-    Session ||--o{ ToolCall : has
-    ToolCall ||--o{ ToolResult : produces
-    
-    Agent ||--o{ ToolDefinition : uses
-    Agent ||--o{ MemorySearch : queries
-    
-    Channel ||--o{ Message : handles
-    Channel ||--o{ Session : routes
-    
-    Gateway ||--o{ Connection : manages
-    Gateway ||--o{ Session : coordinates
-    
-    Plugin ||--o{ ToolDefinition : registers
-    Plugin ||--o{ Hook : handles
-    
-    MemoryManager ||--o{ MemoryIndex : maintains
-    MemoryIndex ||--o{ Chunk : stores
+classDiagram
+    class PluginManifestRecord {
+        <<interface>>
+        +id: string
+        +source: "builtin" | "npm" | "local" | "url"
+        +configSchema?: ZodSchema
+        +kind: "channel" | "tool" | "provider" | "skill" | "composite"
+        +channels?: ChannelId[]
+        +providers?: string[]
+        +skills?: string[]
+    }
+
+    class PluginConfig {
+        <<interface>>
+        +enabled: boolean
+        +settings?: Record~string, unknown~
+    }
+
+    PluginManifestRecord --> PluginConfig : 运行时实例化
+    PluginManifestRecord ..> ChannelPlugin : kind=channel 时提供
+```
+
+> **configSchema 使用 Zod**：插件配置使用 Zod 进行运行时验证，与工具系统的 TypeBox 形成互补——配置面向人类编辑（需要友好错误提示），工具 schema 面向 LLM 调用（需要 JSON Schema 兼容）。
+
+```typescript
+interface PluginManifestRecord {
+  id: string;
+  source: "builtin" | "npm" | "local" | "url";
+  configSchema?: ZodSchema;
+  kind: "channel" | "tool" | "provider" | "skill" | "composite";
+  channels?: ChannelId[];
+  providers?: string[];
+  skills?: string[];
+}
 ```
 
 ---
 
-## 9. 数据流示例
+## 12. 核心 ER 关系图
 
-### 9.1 消息处理数据流
+```mermaid
+erDiagram
+    Agent ||--o{ Session : "manages"
+    Session ||--o{ AgentMessage : "contains"
+    Session ||--o{ ToolCallRecord : "records"
+    Session ||--o{ SubagentRunRecord : "spawns"
+    ToolCallRecord ||--|| ToolDefinition : "references"
+
+    Agent ||--|| AgentConfig : "configured by"
+    Agent ||--|| ContextEngine : "uses"
+    Agent ||--o{ AgentTool : "registers"
+
+    ContextEngine ||--o{ AgentMessage : "manages lifecycle"
+
+    Channel ||--o{ Session : "routes to"
+    Channel ||--|| ChannelPlugin : "implements"
+    ChannelPlugin ||--|| ChannelCapabilities : "declares"
+
+    Gateway ||--o{ GatewayWsClient : "manages connections"
+    Gateway ||--o{ Session : "coordinates"
+    GatewayWsClient ||--|| GatewayConnection : "state"
+
+    PluginManifestRecord ||--o{ ChannelPlugin : "provides channel"
+    PluginManifestRecord ||--o{ ToolDefinition : "provides tool"
+    PluginManifestRecord ||--o{ PluginConfig : "instantiated as"
+
+    MemoryManager ||--o{ MemorySearchResult : "returns"
+    MemoryManager ||--|| files : "indexes"
+    files ||--o{ chunks : "split into"
+    chunks ||--|| chunks_vec : "vector index"
+    chunks ||--|| chunks_fts : "fulltext index"
+
+    EmbeddedRunState ||--o{ EmbeddedPiQueueHandle : "activeRuns"
+    EmbeddedPiQueueHandle ..> Session : "feeds messages"
+```
+
+---
+
+## 13. 运行时 vs 持久化数据结构
+
+| 数据结构 | 类别 | 存储位置 | 生命周期 | 说明 |
+|---------|------|---------|---------|------|
+| `AgentMessage[]` | 运行时 | 内存 | 会话存活期 | 当前对话上下文窗口 |
+| `EmbeddedRunState` | 运行时 | 内存 | 进程存活期 | 管理所有活跃 Agent 运行 |
+| `EmbeddedPiQueueHandle` | 运行时 | 内存 | 单次运行 | 控制消息排队与流式输出 |
+| `ContextEngine` 实例 | 运行时 | 内存 | 会话存活期 | 上下文组装与压缩 |
+| `ChannelConnectionState` | 运行时 | 内存 | 连接存活期 | 通道 WebSocket/HTTP 连接状态 |
+| `ToolCallCache` | 运行时 | 内存 | TTL 过期 | 工具调用结果缓存 |
+| `GatewayWsClient` | 运行时 | 内存 | WebSocket 连接期 | Gateway 客户端连接 |
+| --- | --- | --- | --- | --- |
+| `GatewaySessionRow` | 持久化 | SQLite / JSON | 跨重启 | 会话元数据与配置 |
+| `SessionEntry` | 持久化 | 配置文件 | 跨重启 | 会话路由配置 |
+| `SubagentRunRecord` | 持久化 | SQLite | 跨重启 | 子代理运行历史 |
+| `AuthProfileStore` | 持久化 | JSON 文件 | 跨重启 | API 密钥与认证配置 |
+| `PluginManifestRecord` | 持久化 | 配置文件 | 跨重启 | 插件注册清单 |
+| `files` / `chunks` | 持久化 | SQLite | 跨重启 | 记忆索引数据 |
+| `embedding_cache` | 持久化 | SQLite | 跨重启 | 向量缓存避免重复计算 |
+| `chunks_vec` | 持久化 | SQLite (sqlite-vec) | 跨重启 | 向量相似度索引 |
+| `chunks_fts` | 持久化 | SQLite (FTS5) | 跨重启 | 全文检索索引 |
+
+---
+
+## 14. 数据流总览
+
+### 14.1 端到端消息处理
 
 ```mermaid
 flowchart LR
-    subgraph Input["输入处理"]
-        A[通道接收] --> B[消息解析]
-        B --> C[会话解析]
+    subgraph Input["输入层"]
+        A[ChannelPlugin 接收] --> B[消息解析]
+        B --> C[SessionKey 路由]
     end
-    
-    subgraph Agent["Agent 处理"]
-        D[上下文构建]
-        E[模型调用]
-        F[工具规划]
+
+    subgraph Core["核心处理"]
+        D[ContextEngine.ingest]
+        E[ContextEngine.assemble]
+        F[LLM 调用]
+        G[工具调用循环]
     end
-    
-    subgraph Output["输出处理"]
-        G[响应格式化]
-        H[路由决策]
-        I[通道发送]
+
+    subgraph Output["输出层"]
+        H[ReplyPayload 构建]
+        I[ChannelOutboundContext 格式化]
+        J[通道发送 / Gateway 转发]
     end
-    
+
     C --> D
     D --> E
     E --> F
     F --> G
-    G --> H
+    G -->|需要工具| D
+    G -->|完成| H
     H --> I
-    
-    I -.->|"结果记录"| C
+    I --> J
+
+    J -.->|"更新 GatewaySessionRow"| C
 ```
 
-### 9.2 工具调用数据流
+### 14.2 子代理协作流
 
 ```mermaid
 sequenceDiagram
-    participant A as Agent
-    participant CM as ContextManager
-    participant PG as PolicyGuard
-    participant TE as ToolExecutor
-    participant TR as ToolResult
-    
-    A->>CM: 发起工具调用请求
-    CM->>PG: 验证调用权限
-    PG-->>CM: 权限验证结果
-    
-    CM->>TE: 执行工具 (name, params)
-    TE->>TE: 加载工具实现
-    TE->>TE: 执行工具逻辑
-    
-    TE-->>TR: 捕获执行结果
-    TR->>TR: 格式化结果
-    
-    TR-->>CM: 返回工具结果
-    CM-->>A: 返回最终响应
+    participant P as 主 Agent (Parent)
+    participant SR as SubagentRunRecord
+    participant C as 子 Agent (Child)
+    participant CE as ContextEngine (Child)
+
+    P->>SR: 创建 SubagentRunRecord (createdAt)
+    P->>C: spawn(agentId, task, model)
+    SR->>SR: startedAt = now()
+
+    C->>CE: bootstrap()
+    C->>CE: ingest(task)
+
+    loop 子代理工具调用
+        C->>CE: assemble()
+        CE-->>C: ContextPayload
+        C->>C: LLM 调用 + 工具执行
+        C->>CE: ingest(result)
+    end
+
+    C-->>P: 返回结果
+    SR->>SR: endedAt = now(), outcome = "success"
+    P->>P: 合并子代理结果到主对话
 ```
 
 ---
 
-## 10. 关键类型定义
-
-### 10.1 消息类型
-
-```typescript
-// 核心消息类型定义
-import type { TSchema } from "@sinclair/typebox";
-import type { AgentTool } from "@mariozechner/pi-agent-core";
-
-// 消息角色类型
-type MessageRole = "user" | "assistant" | "tool" | "system";
-
-// 消息内容类型
-type MessageContent = string | Array<ContentBlock>;
-
-interface ContentBlock {
-  type: "text" | "image" | "tool_use" | "tool_result";
-  text?: string;
-  media_url?: string;
-  tool_use?: {
-    id: string;
-    name: string;
-    input: Record<string, unknown>;
-  };
-  tool_result?: {
-    id: string;
-    content: string;
-  };
-}
-
-// Agent 消息接口 (来自 pi-agent-core)
-interface AgentMessage {
-  role: MessageRole;
-  content: MessageContent;
-  timestamp?: number;
-  // 工具相关
-  tool_call_id?: string;
-  tool_name?: string;
-  tool_use_id?: string;
-  // 思考标签
-  is_antthinking?: boolean;
-}
-
-// 通道消息动作
-type ChannelMessageActionName = 
-  | "reaction"
-  | "edit"
-  | "unsend"
-  | "reply"
-  | "thread";
-
-// 回复载荷
-interface ReplyPayload {
-  text?: string;
-  blocks?: Array<Record<string, unknown>>;
-  action?: ChannelMessageActionName;
-  replyTo?: string;
-}
-```
-
-### 10.2 会话类型
-
-```typescript
-// 会话相关类型
-import type { NormalizedChatType } from "../channels/chat-type.js";
-import type { SessionEntry } from "../config/sessions.js";
-import type { DeliveryContext } from "../utils/delivery-context.js";
-
-// 会话密钥类型
-type SessionKey = string;
-
-// 会话类型
-type SessionKind = "direct" | "group" | "global" | "unknown";
-
-// 会话行数据 (数据库存储)
-interface GatewaySessionRow {
-  key: SessionKey;
-  kind: SessionKind;
-  label?: string;
-  displayName?: string;
-  derivedTitle?: string;
-  lastMessagePreview?: string;
-  channel?: string;
-  subject?: string;
-  groupChannel?: string;
-  space?: string;
-  chatType?: NormalizedChatType;
-  origin?: SessionEntry["origin"];
-  updatedAt: number | null;
-  sessionId?: string;
-  systemSent?: boolean;
-  abortedLastRun?: boolean;
-  thinkingLevel?: string;
-  verboseLevel?: string;
-  reasoningLevel?: string;
-  elevatedLevel?: string;
-  sendPolicy?: "allow" | "deny";
-  inputTokens?: number;
-  outputTokens?: number;
-  totalTokens?: number;
-  responseUsage?: "on" | "off" | "tokens" | "full";
-  modelProvider?: string;
-  model?: string;
-  contextTokens?: number;
-  deliveryContext?: DeliveryContext;
-  lastChannel?: SessionEntry["lastChannel"];
-  lastTo?: string;
-  lastAccountId?: string;
-}
-
-// 会话预览项
-interface SessionPreviewItem {
-  role: "user" | "assistant" | "tool" | "system" | "other";
-  text: string;
-}
-
-// 会话预览结果
-interface SessionsPreviewEntry {
-  key: SessionKey;
-  status: "ok" | "empty" | "missing" | "error";
-  items: SessionPreviewItem[];
-}
-
-// 会话配置
-interface SessionConfig {
-  modelProvider: string | null;
-  model: string | null;
-  contextTokens: number | null;
-  thinkingLevel?: string;
-  verboseLevel?: string;
-}
-```
-
-### 10.3 工具类型
-
-```typescript
-// 工具系统类型
-import type { TSchema } from "@sinclair/typebox";
-import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
-
-// 工具配置
-type ToolProfileId = "minimal" | "coding" | "messaging" | "full";
-
-// 工具配置文件
-interface ToolProfilePolicy {
-  allow?: string[];
-  deny?: string[];
-}
-
-// 工具策略来源
-interface SandboxToolPolicySource {
-  source: "agent" | "global" | "default";
-  key: string;
-}
-
-// 解析后的工具策略
-interface SandboxToolPolicyResolved {
-  allow: string[];
-  deny: string[];
-  sources: {
-    allow: SandboxToolPolicySource;
-    deny: SandboxToolPolicySource;
-  };
-}
-
-// 工具调用结果
-type ToolResult<T = unknown> = 
-  | { success: true; data: T }
-  | { success: false; error: string };
-
-// 工具执行上下文
-interface ToolExecutionContext {
-  toolName: string;
-  params: Record<string, unknown>;
-  sessionKey: string;
-  agentId: string;
-  sandboxed?: boolean;
-}
-
-// 工具调用记录
-interface ToolCallRecord {
-  callId: string;
-  toolName: string;
-  params: Record<string, unknown>;
-  startTime: number;
-  endTime?: number;
-  result?: unknown;
-  error?: string;
-  durationMs?: number;
-}
-```
-
-### 10.4 通道类型
-
-```typescript
-// 通道系统类型
-import type { ChannelId } from "./plugins/types.core.js";
-
-// 通道元数据
-interface ChannelMeta {
-  id: ChannelId;
-  label: string;
-  selectionLabel: string;
-  docsPath: string;
-  docsLabel?: string;
-  blurb: string;
-  order?: number;
-  aliases?: string[];
-  systemImage?: string;
-  showConfigured?: boolean;
-}
-
-// 通道账户状态
-type ChannelAccountState =
-  | "linked"
-  | "not linked"
-  | "configured"
-  | "not configured"
-  | "enabled"
-  | "disabled";
-
-// 账户快照
-interface ChannelAccountSnapshot {
-  accountId: string;
-  name?: string;
-  enabled?: boolean;
-  configured?: boolean;
-  linked?: boolean;
-  running?: boolean;
-  connected?: boolean;
-  reconnectAttempts?: number;
-  lastConnectedAt?: number | null;
-  lastDisconnect?: {
-    at: number;
-    status?: number;
-    error?: string;
-    loggedOut?: boolean;
-  } | null;
-  lastMessageAt?: number | null;
-  lastError?: string | null;
-}
-
-// 通道能力
-interface ChannelCapabilities {
-  chatTypes: Array<NormalizedChatType | "thread">;
-  polls?: boolean;
-  reactions?: boolean;
-  edit?: boolean;
-  unsend?: boolean;
-  reply?: boolean;
-  effects?: boolean;
-  groupManagement?: boolean;
-  threads?: boolean;
-  media?: boolean;
-  nativeCommands?: boolean;
-  blockStreaming?: boolean;
-}
-
-// 通道目录条目
-interface ChannelDirectoryEntry {
-  kind: "user" | "group" | "channel";
-  id: string;
-  name?: string;
-  handle?: string;
-  avatarUrl?: string;
-  rank?: number;
-  raw?: unknown;
-}
-```
-
----
-
-## 11. 内存 vs 持久化
-
-### 11.1 内存数据结构
-
-```typescript
-// 内存中临时数据结构
-
-// 会话状态 (内存)
-interface SessionRuntimeState {
-  key: SessionKey;
-  messages: AgentMessage[];
-  contextTokens: number;
-  lastActivityAt: number;
-  isActive: boolean;
-  currentModel?: string;
-  toolCallHistory: ToolCallRecord[];
-}
-
-// Agent 运行时状态
-interface AgentRuntimeState {
-  agentId: string;
-  config: AgentConfig;
-  isRunning: boolean;
-  currentSession?: SessionRuntimeState;
-  toolPolicy: ToolProfilePolicy;
-  embeddedSandbox?: SandboxContext;
-}
-
-// 通道连接状态
-interface ChannelConnectionState {
-  accountId: string;
-  isConnected: boolean;
-  lastPingAt: number;
-  reconnectAttempts: number;
-  pendingMessages: ReplyPayload[];
-}
-
-// 工具调用缓存
-interface ToolCallCache {
-  toolName: string;
-  paramsHash: string;
-  result: unknown;
-  expiresAt: number;
-}
-
-// 上下文窗口状态
-interface ContextWindowState {
-  usedTokens: number;
-  maxTokens: number;
-  warningThreshold: number;
-  compactionNeeded: boolean;
-}
-```
-
-### 11.2 持久化结构
-
-```typescript
-// 持久化存储格式
-
-// 会话文件结构 (JSON)
-interface SessionFile {
-  version: number;
-  key: SessionKey;
-  agentId: string;
-  createdAt: number;
-  updatedAt: number;
-  metadata: {
-    channel?: string;
-    to?: string;
-    subject?: string;
-  };
-  config: {
-    modelProvider?: string;
-    model?: string;
-    thinkingLevel?: string;
-  };
-  messages: AgentMessage[];
-}
-
-// 认证配置文件 (JSON)
-interface AuthProfileStore {
-  version: number;
-  profiles: Record<string, AuthProfileCredential>;
-  order?: Record<string, string[]>;
-  lastGood?: Record<string, string>;
-  usageStats?: Record<string, ProfileUsageStats>;
-}
-
-// 配置快照 (JSON)
-interface ConfigSnapshot {
-  version: number;
-  channels: Record<string, ChannelConfig>;
-  agents: Record<string, AgentConfig>;
-  plugins: Record<string, PluginConfig>;
-  sandboxes?: SandboxConfig;
-  memory?: MemoryProviderStatus;
-}
-
-// 记忆索引数据库 (SQLite)
-interface MemoryIndexSchema {
-  meta: { key: string; value: string };
-  files: { path: string; source: string; hash: string; mtime: number; size: number };
-  chunks: { 
-    id: string; 
-    path: string; 
-    source: string;
-    start_line: number; 
-    end_line: number; 
-    hash: string; 
-    model: string; 
-    text: string; 
-    embedding: string;
-    updated_at: number 
-  };
-  embedding_cache: {
-    provider: string;
-    model: string;
-    provider_key: string;
-    hash: string;
-    embedding: string;
-    dims: number;
-    updated_at: number;
-  };
-}
-```
-
----
-
-## 附录：文件位置索引
+## 附录：关键文件位置索引
 
 | 模块 | 关键文件 | 说明 |
 |------|---------|------|
-| **Agent** | `src/agents/context.ts` | Agent 上下文定义 |
+| **Agent** | `src/agents/context.ts` | Agent 上下文与 ContextEngine |
 | **Agent** | `src/agents/sandbox/types.ts` | 沙箱配置类型 |
 | **Agent** | `src/agents/skills/types.ts` | 技能类型定义 |
 | **Agent** | `src/agents/auth-profiles/types.ts` | 认证配置类型 |
-| **Channel** | `src/channels/plugins/types.core.ts` | 通道核心类型 |
+| **Channel** | `src/channels/plugins/types.core.ts` | 通道核心类型与 ChannelPlugin |
 | **Channel** | `src/channels/plugins/types.adapters.ts` | 通道适配器类型 |
-| **Channel** | `src/channels/session.ts` | 会话通道类型 |
+| **Channel** | `src/channels/session.ts` | 会话通道路由 |
 | **Gateway** | `src/gateway/session-utils.types.ts` | Gateway 会话类型 |
+| **Gateway** | `src/gateway/ws-client.ts` | GatewayWsClient 定义 |
 | **Memory** | `src/memory/types.ts` | 记忆系统类型 |
-| **Memory** | `src/memory/memory-schema.ts` | 记忆数据库 Schema |
-| **Plugin** | `src/plugins/types.ts` | 插件系统类型 |
-| **Tool** | `src/agents/tool-policy.ts` | 工具策略类型 |
+| **Memory** | `src/memory/memory-schema.ts` | SQLite Schema（含 FTS5/vec） |
+| **Plugin** | `src/plugins/types.ts` | PluginManifestRecord |
+| **Tool** | `src/agents/tool-policy.ts` | 工具策略与 Profile |
+| **Embedded** | `src/embedded/pi-queue.ts` | EmbeddedPiQueueHandle |
+| **Embedded** | `src/embedded/run-state.ts` | EmbeddedRunState |
+| **Context** | `src/agents/context-engine.ts` | ContextEngine 接口 |
 
 ---
 
-*文档生成时间: 2026-02-08*
-*OpenClaw 版本: 基于代码分析*
+*基于 OpenClaw v2026.2.3-1 源码分析*

@@ -1,132 +1,131 @@
-# PI 编程 Agent 框架详解
+# PI Agent 框架源码深度分析
 
-> 基于源码的深度分析，帮助你快速理解和使用 PI 框架
+> 基于 OpenClaw 源码的深度剖析，完整揭示 PI 框架的设计理念、核心机制与 OpenClaw 集成细节
 
 ## 目录
 
-- [概述](#概述)
-- [架构设计](#架构设计)
+- [设计理念](#设计理念)
+- [架构总览](#架构总览)
 - [核心模块详解](#核心模块详解)
-  - [pi-ai - 统一 LLM API 层](#pi-ai---统一-llm-api-层)
-  - [pi-coding-agent - 终端编程 Agent](#pi-coding-agent---终端编程-agent)
-- [在 OpenClaw 中的使用](#在-openclaw-中的使用)
+  - [pi-ai — 统一 LLM 抽象层](#pi-ai--统一-llm-抽象层)
+  - [pi-coding-agent — 终端编程 Agent](#pi-coding-agent--终端编程-agent)
+- [OpenClaw 集成深度剖析](#openclaw-集成深度剖析)
+  - [会话生命周期](#会话生命周期)
+  - [Extension 扩展体系](#extension-扩展体系)
+  - [工具分拆策略 (splitSdkTools)](#工具分拆策略-splitsdktools)
+- [Copilot Token 刷新机制](#copilot-token-刷新机制)
+- [Thinking Level 自动降级](#thinking-level-自动降级)
+- [Model Context Window 解析链](#model-context-window-解析链)
+- [Provider 支持矩阵](#provider-支持矩阵)
+- [Tool 系统](#tool-系统)
+- [Session 管理](#session-管理)
+- [流式事件系统](#流式事件系统)
 - [快速上手示例](#快速上手示例)
-- [深入理解](#深入理解)
-  - [Tools 系统](#tools-系统)
-  - [Context 和消息传递](#context-和消息传递)
-  - [Provider 和 Model 管理](#provider-和-model-管理)
-  - [跨 Provider 切换](#跨-provider-切换)
-- [进阶功能](#进阶功能)
-  - [流式处理](#流式处理)
-  - [Thinking/Reasoning](#thinkingreasoning)
-  - [工具调用](#工具调用)
-  - [图像输入](#图像输入)
-  - [OAuth 认证](#oauth-认证)
+- [框架对比](#框架对比)
+- [迁移指南](#迁移指南)
 - [常见问题](#常见问题)
 - [参考资源](#参考资源)
 
 ---
 
-## 概述
+## 设计理念
 
-PI 是一个强大的编程 Agent 框架，由 Mario Zechner 开发，主要包含两个核心包：
+PI 的核心定位可以用一句话概括：
 
-| 包名 | 作用 | OpenClaw 中用途 |
-|------|------|-----------------|
-| `@mariozechner/pi-ai` | 统一 LLM API，提供模型抽象、工具调用、流式处理等 | 核心 LLM 交互层 |
-| `@mariozechner/pi-coding-agent` | 终端编程 CLI，集成 read/write/edit/bash 工具 | 提供 Agent Session 管理 |
+> **统一 LLM 抽象层 + 终端编程 Agent**
 
-### PI 在 OpenClaw 中的定位
+框架拆分为两个独立的 npm 包，各司其职：
+
+| 包名 | 定位 | 核心职责 |
+|------|------|---------|
+| `@mariozechner/pi-ai` | LLM API 统一抽象 | Provider 适配、模型元数据、流式处理、工具调用、Context 序列化 |
+| `@mariozechner/pi-coding-agent` | 终端编程 CLI + Agent 运行时 | Session 管理、内置工具（read/write/edit/bash/grep/find/ls）、Extension/Skill 系统 |
+
+**设计哲学的关键特征：**
+
+- **不内置**：子 Agent、计划模式、MCP、权限弹窗、后台 bash、Todo 列表 —— 全部不在核心里
+- **可扩展**：以上所有功能都可通过 Extensions / Skills 在外部实现
+- **轻量核心**：保持最小化，按需添加功能，避免框架膨胀
+- **Context 即数据**：对话历史是纯 JSON 可序列化数据，天然支持分布式和跨 Provider 传输
 
 ```mermaid
 graph TB
-    subgraph "OpenClaw"
-        A[QQ Bot / WhatsApp] --> B[Gateway]
+    subgraph "OpenClaw 应用层"
+        A[QQ Bot / WhatsApp / Web] --> B[Gateway]
         B --> C[Extension API]
-        C --> D[pi-coding-agent]
-        D --> E[pi-ai]
     end
-    
+
+    subgraph "PI Agent 运行时"
+        C --> D["pi-coding-agent<br/>(Session + Tools + Extensions)"]
+        D --> E["pi-ai<br/>(LLM 抽象层)"]
+    end
+
     subgraph "LLM Providers"
         E --> F[OpenAI / Anthropic / Google]
-        E --> G[Azure / Bedrock]
-        E --> H[Mistral / Groq / xAI]
+        E --> G[Azure / Bedrock / GitHub Copilot]
+        E --> H[Mistral / Groq / xAI / 20+]
     end
-    
+
     D --> D1[Session Manager]
     D --> D2[Tool System]
-    D --> D3[Extensions]
+    D --> D3[Extension Factories]
 ```
 
 ---
 
-## 架构设计
+## 架构总览
 
-### 核心依赖关系
+### 依赖结构
 
 ```
 pi-coding-agent
-├── @mariozechner/pi-ai (核心 LLM 抽象)
+├── @mariozechner/pi-ai          ← 核心 LLM 抽象
 │   ├── @anthropic-ai/sdk
 │   ├── openai
 │   ├── @google/genai
 │   ├── @mistralai/mistralai
 │   ├── @aws-sdk/client-bedrock-runtime
 │   └── ...
-├── @mariozechner/pi-tui (终端 UI)
-├── @mariozechner/pi-agent-core
-└── chalk, glob, marked, diff 等工具
+├── @mariozechner/pi-agent-core  ← Agent 核心类型
+├── @mariozechner/pi-tui         ← 终端 UI
+└── chalk, glob, marked, diff
 ```
 
 ### 源码目录结构
 
 ```
-@ mariozechner/pi-ai/
+@mariozechner/pi-ai/
 ├── src/
-│   ├── types.ts           # 核心类型定义
-│   ├── providers/         # Provider 实现
+│   ├── types.ts              # Context, Tool, Model 等核心类型
+│   ├── providers/            # 各 Provider 适配实现
 │   │   ├── anthropic.ts
 │   │   ├── openai.ts
 │   │   ├── google.ts
 │   │   ├── bedrock.ts
 │   │   └── ...
-│   ├── env-api-keys.ts   # 环境变量认证
-│   ├── oauth.ts          # OAuth 支持
-│   └── ...
-├── dist/
-│   └── index.js          # 编译产物
-├── README.md              # 详细文档
-└── package.json
+│   ├── env-api-keys.ts       # 环境变量认证
+│   └── oauth.ts              # OAuth 支持
 
-@ mariozechner/pi-coding-agent/
+@mariozechner/pi-coding-agent/
 ├── src/
 │   ├── core/
-│   │   ├── session.ts     # Session 管理
-│   │   ├── tools.ts      # 工具系统
+│   │   ├── session.ts        # Session 创建与管理
+│   │   ├── tools.ts          # 工具系统
 │   │   └── ...
 │   ├── modes/
-│   │   ├── interactive/  # 交互模式
-│   │   ├── json/         # JSON 模式
-│   │   └── rpc/          # RPC 模式
+│   │   ├── interactive/      # 终端交互模式
+│   │   ├── json/             # JSON 输出模式
+│   │   └── rpc/              # RPC 调用模式
 │   └── cli.ts
-├── examples/
-├── docs/
-└── package.json
 ```
 
 ---
 
 ## 核心模块详解
 
-### pi-ai - 统一 LLM API 层
+### pi-ai — 统一 LLM 抽象层
 
-#### 1. 核心概念
-
-**Provider**: LLM 提供商（如 OpenAI、Anthropic、Google）
-
-**Model**: 具体模型实例（如 gpt-4o、claude-sonnet-4）
-
-**API**: Provider 使用的接口协议（如 OpenAI Completions API、Anthropic Messages API）
+#### 核心三元组：Provider → API → Model
 
 ```typescript
 // 关系示例
@@ -135,272 +134,841 @@ Provider: "anthropic"
        └── Model: "claude-sonnet-4-20250514"
 
 Provider: "openai"
-  ├── API: "openai-completions" (兼容 OpenAI 协议的如 Mistral, Groq, xAI)
-  └── API: "openai-responses" (OpenAI 官方 Responses API)
+  ├── API: "openai-completions"    // 兼容 OpenAI 协议的 Mistral, Groq, xAI 等
+  └── API: "openai-responses"      // OpenAI 官方 Responses API
 ```
 
-#### 2. 支持的 Provider
+#### Model 元数据
 
-| Provider | API 类型 | 认证方式 |
-|----------|---------|---------|
-| OpenAI | openai-responses / openai-completions | API Key |
-| Anthropic | anthropic-messages | API Key / OAuth |
-| Google | google-generative-ai | API Key / OAuth |
-| Azure OpenAI | azure-openai-responses | API Key |
-| Amazon Bedrock | bedrock-converse-stream | AWS Credentials |
-| Mistral | openai-completions | API Key |
-| Groq | openai-completions | API Key |
-| xAI | openai-completions | API Key |
-| Cerebras | openai-completions | API Key |
-| OpenRouter | openai-completions | API Key |
-| Vercel AI Gateway | openai-completions | API Key |
-| MiniMax | openai-completions | API Key |
-| Kimi For Coding | anthropic-messages | API Key |
-| GitHub Copilot | openai-completions | OAuth |
-| Google Gemini CLI | google-gemini-cli | OAuth |
-| Antigravity | google-generative-ai | OAuth |
-
-#### 3. Model 元数据
-
-每个模型都有丰富的元数据：
+每个模型都携带完整的能力描述和成本信息：
 
 ```typescript
 interface Model<API> {
-  id: string;                    // 模型标识符
-  name: string;                 // 显示名称
-  api: API;                     // 使用的 API 类型
-  provider: string;             // 提供商名称
-  
-  // 能力
-  reasoning: boolean;           // 是否支持 Thinking/Reasoning
-  input: ('text' | 'image')[];  // 支持的输入类型
-  
-  // 成本 (美元/百万 token)
+  id: string;                         // 模型标识符
+  name: string;                       // 显示名称
+  api: API;                           // 使用的 API 协议
+  provider: string;                   // 提供商
+
+  reasoning: boolean;                 // 是否支持 Thinking/Reasoning
+  input: ('text' | 'image')[];       // 支持的输入类型
+
   cost: {
-    input: number;
+    input: number;                    // 美元/百万 token
     output: number;
     cacheRead: number;
     cacheWrite: number;
   };
-  
-  // 限制
-  contextWindow: number;        // 上下文窗口大小 (tokens)
-  maxTokens: number;            // 最大输出 tokens
-  
-  // 连接配置 (可选)
-  baseUrl?: string;             // 自定义 API 地址
-  headers?: Record<string, string>; // 自定义请求头
-  
-  // 兼容性配置 (可选)
-  compat?: OpenAICompletionsCompat;
+
+  contextWindow: number;              // 上下文窗口大小 (tokens)
+  maxTokens: number;                  // 最大输出 tokens
+
+  baseUrl?: string;                   // 自定义 API 地址
+  headers?: Record<string, string>;   // 自定义请求头
+  compat?: OpenAICompletionsCompat;   // 兼容性配置
 }
 ```
 
-### pi-coding-agent - 终端编程 Agent
+### pi-coding-agent — 终端编程 Agent
 
-#### 1. 核心功能
+#### 核心功能
 
-- **交互模式**: 终端 UI，支持快捷键、命令
-- **工具系统**: read/write/edit/bash/grep/find/ls
-- **会话管理**: 自动保存、树形历史、分支、压缩
-- **扩展系统**: TypeScript 插件机制
-- **Skill 系统**: Agent Skills 标准支持
+- **交互模式**：终端 UI，支持快捷键和斜杠命令
+- **工具系统**：7 个内置工具 (read/write/edit/bash/grep/find/ls)
+- **会话管理**：JSONL 持久化、树形历史、分支、自动压缩
+- **扩展系统**：TypeScript Extension API
+- **Skill 系统**：Agent Skills 标准支持
 
-#### 2. 内置工具
+---
+
+## OpenClaw 集成深度剖析
+
+OpenClaw 不是简单地调用 PI SDK，而是围绕 PI 构建了一整套集成层。理解这个集成链路是掌握 OpenClaw Agent 能力的关键。
+
+### 会话生命周期
+
+```mermaid
+sequenceDiagram
+    participant App as OpenClaw 应用层
+    participant Ext as Extension 工厂
+    participant PI as PI Agent Session
+    participant Sub as 事件订阅
+    participant LLM as LLM Provider
+
+    App->>Ext: buildEmbeddedExtensionFactories()
+    Ext-->>App: extensionFactories[]
+
+    App->>PI: createAgentSession({<br/>  tools, customTools,<br/>  resourceLoader, ...})
+    PI-->>App: { session }
+
+    App->>Sub: subscribeEmbeddedPiSession({<br/>  session, onBlockReply,<br/>  onToolResult, ...})
+    Sub-->>App: subscription (事件回调)
+
+    App->>PI: activeSession.prompt(effectivePrompt, { images })
+    PI->>LLM: stream(model, context)
+    LLM-->>PI: text_delta / toolcall_delta / ...
+    PI-->>Sub: Agent 事件流
+    Sub-->>App: onBlockReply / onToolResult / ...
+```
+
+#### 第一步：构建扩展工厂
+
+在创建 Session 之前，OpenClaw 先组装 Extension 工厂，注入压缩保护和上下文修剪能力：
 
 ```typescript
-// 核心工具定义
-interface Tool {
-  name: string;           // 工具名
-  description: string;    // 描述
-  parameters: Schema;      // 参数 Schema
+// openclaw/src/agents/pi-embedded-runner/extensions.ts
+const extensionFactories = buildEmbeddedExtensionFactories({
+  cfg: params.config,
+  sessionManager,
+  provider: params.provider,
+  modelId: params.modelId,
+  model: params.model,
+});
+```
+
+#### 第二步：创建 Agent Session
+
+```typescript
+// openclaw/src/agents/pi-embedded-runner/run/attempt.ts
+const { session } = await createAgentSession({
+  cwd: resolvedWorkspace,
+  agentDir,
+  authStorage: params.authStorage,
+  modelRegistry: params.modelRegistry,
+  model: params.model,
+  thinkingLevel: mapThinkingLevel(params.thinkLevel),
+  tools: builtInTools,
+  customTools: allCustomTools,
+  sessionManager,
+  settingsManager,
+  resourceLoader,
+});
+```
+
+#### 第三步：订阅事件流
+
+通过 `subscribeEmbeddedPiSession` 将 PI Session 的低级事件映射为 OpenClaw 的高层回调：
+
+```typescript
+// openclaw/src/agents/pi-embedded-runner/run/attempt.ts
+const subscription = subscribeEmbeddedPiSession({
+  session: activeSession,
+  runId: params.runId,
+  hookRunner: getGlobalHookRunner() ?? undefined,
+  reasoningMode: params.reasoningLevel ?? "off",
+  toolResultFormat: params.toolResultFormat,
+  onToolResult: params.onToolResult,
+  onReasoningStream: params.onReasoningStream,
+  onBlockReply: params.onBlockReply,
+  onBlockReplyFlush: params.onBlockReplyFlush,
+  onPartialReply: params.onPartialReply,
+  onAssistantMessageStart: params.onAssistantMessageStart,
+  onAgentEvent: params.onAgentEvent,
+  config: params.config,
+});
+```
+
+#### 第四步：发送 Prompt
+
+```typescript
+// 支持可选的图像附件
+if (imageResult.images.length > 0) {
+  await abortable(activeSession.prompt(effectivePrompt, { images: imageResult.images }));
+} else {
+  await abortable(activeSession.prompt(effectivePrompt));
+}
+```
+
+### Extension 扩展体系
+
+OpenClaw 通过 `extensionFactories` 机制向 PI 注入两种关键扩展：
+
+```mermaid
+graph TD
+    A[buildEmbeddedExtensionFactories] --> B{compaction mode?}
+    B -->|safeguard| C[compactionSafeguardExtension]
+    B -->|其他| D[跳过]
+    A --> E{contextPruning mode?}
+    E -->|cache-ttl| F[contextPruningExtension]
+    E -->|其他| G[跳过]
+    C --> H[extensionFactories]
+    F --> H
+    H --> I[DefaultResourceLoader]
+    I --> J[createAgentSession]
+```
+
+#### 压缩保护 (Compaction Safeguard)
+
+当上下文接近窗口上限时，自动触发对话压缩，防止上下文溢出：
+
+```typescript
+// openclaw/src/agents/pi-embedded-runner/extensions.ts
+if (resolveCompactionMode(params.cfg) === "safeguard") {
+  setCompactionSafeguardRuntime(params.sessionManager, {
+    maxHistoryShare: compactionCfg?.maxHistoryShare,
+    contextWindowTokens: contextWindowInfo.tokens,
+    identifierPolicy: compactionCfg?.identifierPolicy,
+    qualityGuardEnabled: qualityGuardCfg?.enabled ?? false,
+    qualityGuardMaxRetries: qualityGuardCfg?.maxRetries,
+    model: params.model,
+    recentTurnsPreserve: compactionCfg?.recentTurnsPreserve,
+  });
+  factories.push(compactionSafeguardExtension);
+}
+```
+
+#### 上下文修剪 (Context Pruning)
+
+基于缓存 TTL 策略，对过期的工具结果进行修剪，降低 Token 消耗：
+
+```typescript
+// openclaw/src/agents/pi-embedded-runner/extensions.ts
+function buildContextPruningFactory(params) {
+  const raw = params.cfg?.agents?.defaults?.contextPruning;
+  if (raw?.mode !== "cache-ttl") return undefined;
+  if (!isCacheTtlEligibleProvider(params.provider, params.modelId)) return undefined;
+
+  const settings = computeEffectiveSettings(raw);
+  setContextPruningRuntime(params.sessionManager, {
+    settings,
+    contextWindowTokens: resolveContextWindowTokens(params),
+    isToolPrunable: makeToolPrunablePredicate(settings.tools),
+    lastCacheTouchAt: readLastCacheTtlTimestamp(params.sessionManager),
+  });
+  return contextPruningExtension;
+}
+```
+
+### 工具分拆策略 (splitSdkTools)
+
+OpenClaw 通过 `splitSdkTools` 将所有工具统一转为 `customTools`，再与客户端工具合并，一起传入 Agent Session：
+
+```typescript
+// openclaw/src/agents/pi-embedded-runner/tool-split.ts
+export function splitSdkTools(options: {
+  tools: AnyAgentTool[];
+  sandboxEnabled: boolean;
+}): {
+  builtInTools: AnyAgentTool[];
+  customTools: ReturnType<typeof toToolDefinitions>;
+} {
+  return {
+    builtInTools: [],                    // PI 内置工具清空
+    customTools: toToolDefinitions(tools), // 全部转为自定义工具定义
+  };
+}
+```
+
+使用方式：
+
+```typescript
+// attempt.ts
+const { builtInTools, customTools } = splitSdkTools({
+  tools,
+  sandboxEnabled: !!sandbox?.enabled,
+});
+
+// 追加 OpenResponses 等客户端工具
+const allCustomTools = [...customTools, ...clientToolDefs];
+
+const { session } = await createAgentSession({
+  tools: builtInTools,          // 空数组 — 不使用 PI 默认内置工具
+  customTools: allCustomTools,  // OpenClaw 完全控制工具集
+  // ...
+});
+```
+
+> **设计意图**：OpenClaw 需要对工具的权限、沙箱行为、输出格式等进行精细控制，因此选择将所有工具提升为 `customTools`，绕过 PI 的内置工具默认行为。
+
+---
+
+## Copilot Token 刷新机制
+
+GitHub Copilot 的 API Token 有生命周期限制，OpenClaw 实现了自动刷新机制保证长会话不中断。
+
+```mermaid
+stateDiagram-v2
+    [*] --> 初始认证
+    初始认证 --> Token有效: resolveCopilotApiToken()
+    Token有效 --> 定时刷新: scheduleCopilotRefresh()
+    定时刷新 --> Token有效: refreshCopilotToken("scheduled")
+    定时刷新 --> 重试: 刷新失败
+    重试 --> Token有效: refreshCopilotToken("scheduled-retry")
+    Token有效 --> 认证错误处理: 401/403 错误
+    认证错误处理 --> Token有效: refreshCopilotToken("auth-error")
+    认证错误处理 --> 会话终止: 刷新仍失败
+```
+
+### refreshCopilotToken()
+
+核心刷新函数，内部维护 `refreshInFlight` 防止并发刷新：
+
+```typescript
+// openclaw/src/agents/pi-embedded-runner/run.ts
+const refreshCopilotToken = async (reason: string): Promise<void> => {
+  if (!copilotTokenState) return;
+  if (copilotTokenState.refreshInFlight) {
+    await copilotTokenState.refreshInFlight;  // 等待已有的刷新完成
+    return;
+  }
+  const { resolveCopilotApiToken } = await import("../../providers/github-copilot-token.js");
+  copilotTokenState.refreshInFlight = (async () => {
+    const copilotToken = await resolveCopilotApiToken({
+      githubToken: copilotTokenState.githubToken.trim(),
+    });
+    authStorage.setRuntimeApiKey(model.provider, copilotToken.token);
+    copilotTokenState.expiresAt = copilotToken.expiresAt;
+  })()
+    .catch((err) => { /* 错误处理 */ })
+    .finally(() => { copilotTokenState.refreshInFlight = undefined; });
+
+  await copilotTokenState.refreshInFlight;
+};
+```
+
+### scheduleCopilotRefresh()
+
+定时调度器，在 Token 过期前提前刷新：
+
+```typescript
+// openclaw/src/agents/pi-embedded-runner/run.ts
+const scheduleCopilotRefresh = (): void => {
+  if (!copilotTokenState || copilotRefreshCancelled) return;
+  clearCopilotRefreshTimer();
+  const now = Date.now();
+  const refreshAt = copilotTokenState.expiresAt - COPILOT_REFRESH_MARGIN_MS;
+  const delayMs = Math.max(COPILOT_REFRESH_MIN_DELAY_MS, refreshAt - now);
+
+  const timer = setTimeout(() => {
+    refreshCopilotToken("scheduled")
+      .then(() => scheduleCopilotRefresh())       // 成功后重新调度
+      .catch(() => {
+        // 失败后延迟重试
+        setTimeout(() => {
+          refreshCopilotToken("scheduled-retry")
+            .then(() => scheduleCopilotRefresh());
+        }, COPILOT_REFRESH_RETRY_MS);
+      });
+  }, delayMs);
+
+  copilotTokenState.refreshTimer = timer;
+};
+```
+
+### 认证错误自动恢复
+
+当请求遇到 401/403 认证错误时，自动触发 Token 刷新并重试：
+
+```typescript
+const maybeRefreshCopilotForAuthError = async (
+  errorText: string,
+  retried: boolean,
+): Promise<boolean> => {
+  if (!copilotTokenState || retried) return false;
+  if (!isFailoverErrorMessage(errorText)) return false;
+  if (classifyFailoverReason(errorText) !== "auth") return false;
+  try {
+    await refreshCopilotToken("auth-error");
+    scheduleCopilotRefresh();
+    return true;     // 允许上层重试
+  } catch {
+    return false;    // 放弃
+  }
+};
+```
+
+---
+
+## Thinking Level 自动降级
+
+不同 Provider 和模型对 Thinking/Reasoning 的支持级别不同。OpenClaw 实现了 `pickFallbackThinkingLevel()` 进行自动降级，确保请求不会因为不支持的 thinking level 而失败。
+
+```mermaid
+flowchart TD
+    A[发送请求<br/>thinkingLevel = high] --> B{请求成功?}
+    B -->|是| C[正常返回]
+    B -->|否| D[捕获错误消息]
+    D --> E[pickFallbackThinkingLevel]
+    E --> F{能提取支持的 level?}
+    F -->|是| G[找到未尝试过的 level]
+    F -->|否| H{消息包含<br/>'not supported'?}
+    H -->|是| I["降级到 'off'"]
+    H -->|否| J[无法降级, 抛出错误]
+    G --> K{是否已尝试过?}
+    K -->|否| L[使用该 level 重试]
+    K -->|全部已试| J
+    I --> L
+    L --> A
+```
+
+### pickFallbackThinkingLevel()
+
+```typescript
+// openclaw/src/agents/pi-embedded-helpers/thinking.ts
+export function pickFallbackThinkingLevel(params: {
+  message?: string;
+  attempted: Set<ThinkLevel>;
+}): ThinkLevel | undefined {
+  const raw = params.message?.trim();
+  if (!raw) return undefined;
+
+  const supported = extractSupportedValues(raw);
+  if (supported.length === 0) {
+    // 错误明确指出不支持但没列出可用值时，直接降到 "off"
+    if (/not supported/i.test(raw) && !params.attempted.has("off")) {
+      return "off";
+    }
+    return undefined;
+  }
+
+  for (const entry of supported) {
+    const normalized = normalizeThinkLevel(entry);
+    if (!normalized) continue;
+    if (params.attempted.has(normalized)) continue;
+    return normalized;  // 返回第一个未尝试过的支持级别
+  }
+  return undefined;
+}
+```
+
+### 调用场景
+
+在 `run.ts` 的主循环中，遇到 thinking level 不支持的错误时自动降级：
+
+```typescript
+// prompt 错误时
+const fallbackThinking = pickFallbackThinkingLevel({
+  message: errorText,
+  attempted: attemptedThinking,
+});
+if (fallbackThinking) {
+  log.warn(`unsupported thinking level for ${provider}/${modelId}; retrying with ${fallbackThinking}`);
+  thinkLevel = fallbackThinking;
+  continue;  // 重试循环
 }
 
-// 内置工具
+// assistant 消息错误时
+const fallbackThinking = pickFallbackThinkingLevel({
+  message: lastAssistant?.errorMessage,
+  attempted: attemptedThinking,
+});
+if (fallbackThinking && !aborted) {
+  thinkLevel = fallbackThinking;
+  continue;
+}
+```
+
+### 跨 Provider Thinking 块转换
+
+当对话历史中包含 Thinking 块，而目标 Provider 使用不同 API 时，PI 自动进行转换：
+
+| 源消息类型 | 同 API Provider | 不同 API Provider |
+|-----------|----------------|-------------------|
+| Thinking 块 | 保持原生格式 | 转换为 `<thinking>...</thinking>` 文本标签 |
+| 其他内容 | 保持不变 | 保持不变 |
+
+---
+
+## Model Context Window 解析链
+
+OpenClaw 实现了多层级的上下文窗口解析链，确保模型在合理的 Token 限制内运行。
+
+```mermaid
+flowchart LR
+    A["modelsConfig<br/>(YAML 配置)"] -->|优先级 1| D[baseInfo]
+    B["model.contextWindow<br/>(PI SDK 元数据)"] -->|优先级 2| D
+    C["DEFAULT_CONTEXT_TOKENS<br/>(硬编码默认值)"] -->|优先级 3| D
+    D --> E{"agents.defaults.contextTokens<br/>配置了上限?"}
+    E -->|"是 & 小于 baseInfo"| F["{ tokens: cap, source: 'agentContextTokens' }"]
+    E -->|否| G[返回 baseInfo]
+```
+
+### resolveContextWindowInfo()
+
+```typescript
+// openclaw/src/agents/context-window-guard.ts
+export function resolveContextWindowInfo(params: {
+  cfg: OpenClawConfig | undefined;
+  provider: string;
+  modelId: string;
+  modelContextWindow?: number;
+  defaultTokens: number;
+}): ContextWindowInfo {
+  // 优先级 1：YAML 配置中的 models.providers[provider].models[id].contextWindow
+  const fromModelsConfig = (() => {
+    const providers = params.cfg?.models?.providers;
+    const providerEntry = providers?.[params.provider];
+    const models = Array.isArray(providerEntry?.models) ? providerEntry.models : [];
+    const match = models.find((m) => m?.id === params.modelId);
+    return normalizePositiveInt(match?.contextWindow);
+  })();
+
+  // 优先级 2：PI SDK 模型元数据中的 contextWindow
+  const fromModel = normalizePositiveInt(params.modelContextWindow);
+
+  // 优先级 3：硬编码默认值
+  const baseInfo = fromModelsConfig
+    ? { tokens: fromModelsConfig, source: "modelsConfig" }
+    : fromModel
+      ? { tokens: fromModel, source: "model" }
+      : { tokens: Math.floor(params.defaultTokens), source: "default" };
+
+  // 应用 agents.defaults.contextTokens 上限
+  const capTokens = normalizePositiveInt(params.cfg?.agents?.defaults?.contextTokens);
+  if (capTokens && capTokens < baseInfo.tokens) {
+    return { tokens: capTokens, source: "agentContextTokens" };
+  }
+
+  return baseInfo;
+}
+```
+
+### 安全保护常量
+
+```typescript
+export const CONTEXT_WINDOW_HARD_MIN_TOKENS = 16_000;   // 低于此值直接拒绝
+export const CONTEXT_WINDOW_WARN_BELOW_TOKENS = 32_000;  // 低于此值输出警告
+```
+
+### evaluateContextWindowGuard()
+
+```typescript
+// openclaw/src/agents/context-window-guard.ts
+export function evaluateContextWindowGuard(params: {
+  info: ContextWindowInfo;
+  warnBelowTokens?: number;
+  hardMinTokens?: number;
+}): ContextWindowGuardResult {
+  const warnBelow = Math.max(1, Math.floor(params.warnBelowTokens ?? CONTEXT_WINDOW_WARN_BELOW_TOKENS));
+  const hardMin = Math.max(1, Math.floor(params.hardMinTokens ?? CONTEXT_WINDOW_HARD_MIN_TOKENS));
+  const tokens = Math.max(0, Math.floor(params.info.tokens));
+  return {
+    ...params.info,
+    tokens,
+    shouldWarn: tokens > 0 && tokens < warnBelow,    // < 32,000 → 警告
+    shouldBlock: tokens > 0 && tokens < hardMin,     // < 16,000 → 阻断
+  };
+}
+```
+
+### 在运行时的应用
+
+```typescript
+// openclaw/src/agents/pi-embedded-runner/run.ts
+const ctxInfo = resolveContextWindowInfo({
+  cfg: params.config, provider, modelId,
+  modelContextWindow: model.contextWindow,
+  defaultTokens: DEFAULT_CONTEXT_TOKENS,
+});
+
+// 将解析后的有效窗口回写到模型，让 PI 的自动压缩使用正确的阈值
+const effectiveModel = ctxInfo.tokens < (model.contextWindow ?? Infinity)
+  ? { ...model, contextWindow: ctxInfo.tokens }
+  : model;
+
+const ctxGuard = evaluateContextWindowGuard({
+  info: ctxInfo,
+  warnBelowTokens: CONTEXT_WINDOW_WARN_BELOW_TOKENS,
+  hardMinTokens: CONTEXT_WINDOW_HARD_MIN_TOKENS,
+});
+
+if (ctxGuard.shouldBlock) {
+  throw new FailoverError(
+    `Model context window too small (${ctxGuard.tokens} tokens). Minimum is ${CONTEXT_WINDOW_HARD_MIN_TOKENS}.`,
+    { reason: "unknown", provider, model: modelId },
+  );
+}
+```
+
+---
+
+## Provider 支持矩阵
+
+| Provider | API 类型 | 认证方式 | Reasoning | Vision |
+|----------|---------|---------|-----------|--------|
+| OpenAI | openai-responses / openai-completions | API Key | ✓ (o1/o3/gpt-5) | ✓ |
+| Anthropic | anthropic-messages | API Key / OAuth | ✓ (Claude Sonnet 4) | ✓ |
+| Google | google-generative-ai | API Key / OAuth | ✓ (Gemini 2.5) | ✓ |
+| Azure OpenAI | azure-openai-responses | API Key | ✓ | ✓ |
+| Amazon Bedrock | bedrock-converse-stream | AWS Credentials | 部分 | ✓ |
+| Mistral | openai-completions | API Key | 部分 | 部分 |
+| Groq | openai-completions | API Key | 部分 | ✗ |
+| xAI | openai-completions | API Key | 部分 (Grok) | ✗ |
+| Cerebras | openai-completions | API Key | 部分 | ✗ |
+| OpenRouter | openai-completions | API Key | 取决于模型 | 取决于模型 |
+| Vercel AI Gateway | openai-completions | API Key | 取决于模型 | 取决于模型 |
+| MiniMax | openai-completions | API Key | ✗ | ✗ |
+| Kimi For Coding | anthropic-messages | API Key | ✗ | ✗ |
+| GitHub Copilot | openai-completions | OAuth | 取决于模型 | 取决于模型 |
+| Google Gemini CLI | google-gemini-cli | OAuth | ✓ | ✓ |
+| Antigravity | google-generative-ai | OAuth | 取决于模型 | 取决于模型 |
+
+> 通过 `openai-completions` 协议，任何兼容 OpenAI API 的服务都可以接入，包括 Ollama 本地模型。
+
+---
+
+## Tool 系统
+
+### TypeBox Schema 定义
+
+PI 使用 TypeBox 进行类型安全的工具参数定义：
+
+```typescript
+import { Type, StringEnum } from '@mariozechner/pi-ai';
+
+const tools: Tool[] = [{
+  name: 'get_weather',
+  description: 'Get current weather for a location',
+  parameters: Type.Object({
+    location: Type.String({ description: 'City name' }),
+    units: Type.Optional(
+      StringEnum(['celsius', 'fahrenheit'], { default: 'celsius' })
+    )
+  })
+}];
+```
+
+支持的类型：
+
+| TypeBox | 用途 | 示例 |
+|---------|------|------|
+| `Type.String()` | 字符串 | 文件路径、名称 |
+| `Type.Number()` | 数值 | 行号、计数 |
+| `Type.Boolean()` | 布尔值 | 开关标志 |
+| `Type.Array(T)` | 数组 | 文件列表 |
+| `Type.Object({})` | 对象 | 复杂参数 |
+| `Type.Optional(T)` | 可选字段 | 默认值参数 |
+| `StringEnum([])` | 枚举 | 模式选择 |
+
+### 内置工具
+
+```typescript
 const BUILTIN_TOOLS = [
-  'read',    // 读取文件
+  'read',    // 读取文件内容
   'write',   // 创建/覆盖文件
-  'edit',    // 编辑文件
+  'edit',    // 精确编辑文件
   'bash',    // 执行 Shell 命令
-  'grep',    // 文本搜索
+  'grep',    // 文本搜索 (ripgrep)
   'find',    // 文件查找
   'ls',      // 列出目录
 ];
 ```
 
-#### 3. 会话管理
+### 工具调用流程
 
 ```mermaid
-graph LR
-    A[用户输入] --> B[Session]
-    B --> C[JSONL 文件]
-    
-    subgraph "Session 结构"
-        B --> B1[消息树]
-        B1 --> M1[User: Hello]
-        B1 --> M2[Assistant: Hi!]
-        B1 --> M3[User: Help me]
-        M3 --> M4[Assistant: Done]
-        M3 --> M5[Branch: Alternative]
-    end
-    
-    C --> D[~/.pi/agent/sessions/]
+sequenceDiagram
+    participant U as 用户
+    participant M as LLM 模型
+    participant V as 参数验证
+    participant T as 工具执行
+    participant E as 外部系统
+
+    U->>M: 用户请求
+    M->>V: toolCall(name, args)
+    V->>V: validateToolCall(tools, block)
+    V->>T: 验证通过
+    T->>E: 执行操作
+    E-->>T: 结果
+    T-->>M: toolResult(id, result/error)
+    M-->>U: 最终回复
+```
+
+### 工具调用验证
+
+```typescript
+import { validateToolCall } from '@mariozechner/pi-ai';
+
+for (const block of response.content) {
+  if (block.type === 'toolCall') {
+    try {
+      const validatedArgs = validateToolCall(tools, block);
+      const result = await executeMyTool(block.name, validatedArgs);
+
+      context.messages.push({
+        role: 'toolResult',
+        toolCallId: block.id,
+        toolName: block.name,
+        content: [{ type: 'text', text: result }],
+        isError: false,
+        timestamp: Date.now()
+      });
+    } catch (error) {
+      context.messages.push({
+        role: 'toolResult',
+        toolCallId: block.id,
+        toolName: block.name,
+        content: [{ type: 'text', text: error.message }],
+        isError: true,     // 让模型看到错误并重试
+        timestamp: Date.now()
+      });
+    }
+  }
+}
 ```
 
 ---
 
-## 在 OpenClaw 中的使用
+## Session 管理
 
-### 1. Extension API 集成
+### JSONL 树形历史
 
-```typescript
-// extensionAPI.ts 中的关键导入
-import {
-  CURRENT_SESSION_VERSION,
-  SessionManager,
-  SettingsManager,
-  codingTools,
-  createAgentSession,
-  createEditTool,
-  createReadTool,
-  createWriteTool,
-  estimateTokens,
-  readTool
-} from "@mariozechner/pi-coding-agent";
+PI 的会话不是简单的线性列表，而是树形结构，支持分支和回溯：
 
-import {
-  complete,
-  completeSimple,
-  streamSimple
-} from "@mariozechner/pi-ai";
+```mermaid
+graph TD
+    A["User: 帮我写一个 HTTP 服务器"] --> B["Assistant: 好的，我来写..."]
+    B --> C["User: 改用 Express"]
+    C --> D["Assistant: 已改为 Express..."]
+    C --> E["分支: 用 Fastify 替代"]
+    E --> F["Assistant: 已改为 Fastify..."]
+    B --> G["分支: 用 Python 写"]
+    G --> H["Assistant: 这是 Flask 版本..."]
 ```
 
-### 2. 创建 Agent Session
+会话持久化为 JSONL 文件，存储在 `~/.pi/agent/sessions/` 目录。
+
+### 会话操作
+
+| 命令 | 功能 |
+|------|------|
+| `/tree` | 浏览会话树 |
+| `/fork` | 从当前节点创建分支 |
+| `/compact` | 手动触发上下文压缩 |
+
+### Context 序列化
+
+Context 是纯 JSON，天然支持序列化和跨 Provider 传输：
 
 ```typescript
-import { createAgentSession } from "@mariozechner/pi-coding-agent";
-
-// 创建会话
-const { session } = await createAgentSession({
-  sessionManager: SessionManager.inMemory(),  // 或持久化
-  authStorage: new AuthStorage(),
-  modelRegistry: new ModelRegistry(authStorage),
-});
-
-// 发送提示
-await session.prompt("List all .ts files in src/");
-```
-
-### 3. 流式交互
-
-```typescript
-import { stream, complete } from "@mariozechner/pi-ai";
-
-// 获取模型
-const model = getModel('openai', 'gpt-4o-mini');
-
-// 构建上下文
 const context: Context = {
   systemPrompt: 'You are a helpful assistant.',
-  messages: [{ role: 'user', content: 'Hello!' }],
+  messages: [
+    { role: 'user', content: 'Hello!' },
+    { role: 'assistant', content: [{ type: 'text', text: 'Hi!' }] }
+  ],
   tools: [/* 工具定义 */]
 };
 
-// 流式输出
-const streamResult = stream(model, context);
-for await (const event of streamResult) {
+const serialized = JSON.stringify(context);
+const restored: Context = JSON.parse(serialized);
+const response = await complete(model, restored);  // 完美恢复
+```
+
+---
+
+## 流式事件系统
+
+### 事件类型
+
+```typescript
+const s = stream(model, context);
+
+for await (const event of s) {
   switch (event.type) {
-    case 'text_delta':
-      process.stdout.write(event.delta);
-      break;
-    case 'toolcall_end':
-      console.log(`Tool: ${event.toolCall.name}`);
-      break;
-    case 'done':
-      console.log(`\nFinished: ${event.reason}`);
-      break;
+    case 'start':           // 流开始
+    case 'text_start':      // 文本块开始
+    case 'text_delta':      // 文本增量
+    case 'text_end':        // 文本块结束
+    case 'thinking_start':  // Thinking 开始
+    case 'thinking_delta':  // Thinking 增量
+    case 'thinking_end':    // Thinking 结束
+    case 'toolcall_start':  // 工具调用开始
+    case 'toolcall_delta':  // 工具参数增量 (渐进式 JSON)
+    case 'toolcall_end':    // 工具调用完成
+    case 'done':            // 流结束
+    case 'error':           // 错误
   }
 }
 
-// 非流式
-const response = await complete(model, context);
+const result = await s.result();
+```
+
+### 渐进式 JSON 解析
+
+在 `toolcall_delta` 期间，工具参数是逐步解析的：
+
+```typescript
+for await (const event of s) {
+  if (event.type === 'toolcall_delta') {
+    const call = event.partial.content[event.contentIndex];
+    if (call.type === 'toolCall') {
+      // 注意：参数可能不完整
+      // - 字符串可能被截断
+      // - 数组可能不完整
+      // - 嵌套对象可能部分填充
+      if (call.arguments?.path) {
+        console.log(`Writing to: ${call.arguments.path}`);
+      }
+    }
+  }
+}
+```
+
+### Abort/Resume 支持
+
+```typescript
+const controller = new AbortController();
+setTimeout(() => controller.abort(), 5000);
+
+const s = stream(model, context, { signal: controller.signal });
+
+for await (const event of s) {
+  if (event.type === 'text_delta') process.stdout.write(event.delta);
+}
+
+const partial = await s.result();
+if (partial.stopReason === 'aborted') {
+  // 添加部分响应并继续
+  context.messages.push(partial);
+  context.messages.push({ role: 'user', content: 'Please continue' });
+  const continuation = await complete(model, context);
+}
 ```
 
 ---
 
 ## 快速上手示例
 
-### 示例 1: 基础对话
+### 基础对话
 
 ```typescript
 import { getModel, complete } from '@mariozechner/pi-ai';
 
 const model = getModel('anthropic', 'claude-sonnet-4-20250514');
-
 const response = await complete(model, {
   messages: [{ role: 'user', content: 'What is TypeScript?' }]
 });
 
 for (const block of response.content) {
-  if (block.type === 'text') {
-    console.log(block.text);
-  }
+  if (block.type === 'text') console.log(block.text);
 }
 ```
 
-### 示例 2: 工具调用
+### 工具调用
 
 ```typescript
-import { Type, getModel, complete, Context, Tool } from '@mariozechner/pi-ai';
+import { Type, getModel, complete, Tool } from '@mariozechner/pi-ai';
 
-// 定义工具
 const tools: Tool[] = [{
   name: 'get_weather',
   description: 'Get current weather for a location',
   parameters: Type.Object({
-    location: Type.String({ description: 'City name' }),
-    units: Type.Optional(Type.String({ enum: ['celsius', 'fahrenheit'], default: 'celsius' }))
+    city: Type.String({ description: 'City name' })
   })
 }];
 
-const context: Context = {
+const response = await complete(getModel('openai', 'gpt-4o-mini'), {
   messages: [{ role: 'user', content: 'What is the weather in Tokyo?' }],
   tools
-};
-
-const response = await complete(getModel('openai', 'gpt-4o-mini'), context);
-
-// 处理工具调用
-for (const block of response.content) {
-  if (block.type === 'toolCall') {
-    console.log(`Calling: ${block.name}(${JSON.stringify(block.arguments)})`);
-    
-    // 执行工具并添加结果
-    context.messages.push({
-      role: 'toolResult',
-      toolCallId: block.id,
-      toolName: block.name,
-      content: [{ type: 'text', text: 'Sunny, 25°C' }],
-      isError: false,
-      timestamp: Date.now()
-    });
-  }
-}
-
-// 继续对话
-if (hasToolCalls) {
-  const continuation = await complete(model, context);
-}
+});
 ```
 
-### 示例 3: Thinking/Reasoning
+### Thinking/Reasoning
 
 ```typescript
 import { getModel, completeSimple } from '@mariozechner/pi-ai';
 
 const model = getModel('anthropic', 'claude-sonnet-4-20250514');
-
-// 启用 thinking
 const response = await completeSimple(model, {
   messages: [{ role: 'user', content: 'Solve: 2x + 5 = 13' }]
 }, {
@@ -408,45 +976,16 @@ const response = await completeSimple(model, {
 });
 
 for (const block of response.content) {
-  if (block.type === 'thinking') {
-    console.log('Thinking:', block.thinking);
-  } else if (block.type === 'text') {
-    console.log('Response:', block.text);
-  }
+  if (block.type === 'thinking') console.log('思考过程:', block.thinking);
+  else if (block.type === 'text') console.log('回答:', block.text);
 }
 ```
 
-### 示例 4: 图像输入
+### 自定义模型 (Ollama)
 
 ```typescript
-import { readFileSync } from 'fs';
-import { getModel, complete } from '@mariozechner/pi-ai';
+import { Model, complete } from '@mariozechner/pi-ai';
 
-const model = getModel('openai', 'gpt-4o-mini');
-
-// 检查模型是否支持图像
-if (model.input.includes('image')) {
-  const imageBuffer = readFileSync('image.png');
-  const base64Image = imageBuffer.toString('base64');
-  
-  const response = await complete(model, {
-    messages: [{
-      role: 'user',
-      content: [
-        { type: 'text', text: 'What is in this image?' },
-        { type: 'image', data: base64Image, mimeType: 'image/png' }
-      ]
-    }]
-  });
-}
-```
-
-### 示例 5: 自定义 Model
-
-```typescript
-import { Model } from '@mariozechner/pi-ai';
-
-// Ollama 自定义模型
 const ollamaModel: Model<'openai-completions'> = {
   id: 'llama-3.1-8b',
   name: 'Llama 3.1 8B (Ollama)',
@@ -458,506 +997,34 @@ const ollamaModel: Model<'openai-completions'> = {
   maxTokens: 32000
 };
 
-// 使用
-const response = await complete(ollamaModel, context, {
-  apiKey: 'dummy'  // Ollama 不需要 API Key
-});
-```
-
----
-
-## 深入理解
-
-### Tools 系统
-
-#### TypeBox Schema
-
-PI 使用 TypeBox 进行类型安全的工具定义：
-
-```typescript
-import { Type, StringEnum } from '@mariozechner/pi-ai';
-
-// 基础类型
-Type.String()
-Type.Number()
-Type.Boolean()
-Type.Array(Type.String())
-Type.Object({ ... })
-
-// 带选项
-Type.String({ description: 'Name', minLength: 1 })
-Type.Optional(Type.String())  // 可选字段
-
-// 枚举
-StringEnum(['a', 'b', 'c'], { default: 'a' })
-
-// 复杂结构
-Type.Object({
-  name: Type.String(),
-  age: Type.Number(),
-  tags: Type.Array(Type.String()),
-  address: Type.Optional(Type.Object({
-    city: Type.String(),
-    zip: Type.String()
-  }))
-})
-```
-
-#### 工具调用流程
-
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant M as Model
-    participant T as Tool System
-    participant E as External API
-    
-    U->>M: Request
-    M->>T: toolCall(name, args)
-    T->>E: API Call
-    E-->>T: Result
-    T-->>M: toolResult(id, result)
-    M-->>U: Final Response
-```
-
-### Context 和消息传递
-
-#### 消息类型
-
-```typescript
-// 用户消息
-{ role: 'user', content: 'Hello!' }
-
-// 助手消息 (LLM 响应)
-{ role: 'assistant', content: [...] }
-
-// 工具调用结果
-{ 
-  role: 'toolResult', 
-  toolCallId: 'call_123',
-  toolName: 'get_weather',
-  content: [{ type: 'text', text: 'Sunny, 25°C' }],
-  isError: false,
-  timestamp: 1234567890
-}
-
-// 助手消息内容块
-type ContentBlock = 
-  | { type: 'text', text: string }
-  | { type: 'toolCall', id: string, name: string, arguments: Record<string, unknown> }
-  | { type: 'thinking', thinking: string }
-  | { type: 'image', data: string, mimeType: string };
-```
-
-#### Context 序列化
-
-```typescript
-const context: Context = {
-  systemPrompt: 'You are a helpful assistant.',
-  messages: [
-    { role: 'user', content: 'Hello!' },
-    { role: 'assistant', content: [{ type: 'text', text: 'Hi there!' }] }
-  ],
-  tools: [/* 工具定义 */]
-};
-
-// JSON 序列化 - 完美支持分布式
-const serialized = JSON.stringify(context);
-const restored: Context = JSON.parse(serialized);
-
-// 继续使用
-const response = await complete(model, restored);
-```
-
-### Provider 和 Model 管理
-
-#### 查询可用模型
-
-```typescript
-import { getProviders, getModels, getModel } from '@mariozechner/pi-ai';
-
-// 所有 Provider
-const providers = getProviders();
-// ['openai', 'anthropic', 'google', 'xai', 'groq', ...]
-
-// Provider 下所有模型
-const models = getModels('anthropic');
-for (const model of models) {
-  console.log(`${model.id}: ${model.name}`);
-  console.log(`  Context: ${model.contextWindow} tokens`);
-  console.log(`  Vision: ${model.input.includes('image')}`);
-  console.log(`  Reasoning: ${model.reasoning}`);
-}
-
-// 获取具体模型
-const model = getModel('openai', 'gpt-4o-mini');
-```
-
-#### Provider 特定选项
-
-```typescript
-// OpenAI
-await complete(model, context, {
-  reasoningEffort: 'medium',
-  reasoningSummary: 'detailed'  // Responses API only
-});
-
-// Anthropic
-await complete(model, context, {
-  thinkingEnabled: true,
-  thinkingBudgetTokens: 8192
-});
-
-// Google
-await complete(model, context, {
-  thinking: {
-    enabled: true,
-    budgetTokens: 8192  // -1 for dynamic
-  }
-});
-```
-
-### 跨 Provider 切换
-
-#### 自动转换
-
-```typescript
-import { getModel, complete, Context } from '@mariozechner/pi-ai';
-
-const context: Context = { messages: [] };
-
-// 从 Anthropic 开始
-const claude = getModel('anthropic', 'claude-sonnet-4-20250514');
-context.messages.push({ role: 'user', content: 'What is 25 * 18?' });
-const claudeResponse = await complete(claude, context);
-context.messages.push(claudeResponse);
-
-// 切换到 OpenAI - 自动转换 thinking 为 <thinking> 标签
-const gpt5 = getModel('openai', 'gpt-5-mini');
-context.messages.push({ role: 'user', content: 'Is that correct?' });
-const gptResponse = await complete(gpt5, context);
-context.messages.push(gptResponse);
-
-// 再切换到 Google
-const gemini = getModel('google', 'gemini-2.5-flash');
-context.messages.push({ role: 'user', content: 'What was the question?' });
-const geminiResponse = await complete(gemini, context);
-```
-
-#### 转换规则
-
-| 源消息类型 | 同 API Provider | 不同 API Provider |
-|-----------|-----------------|-------------------|
-| User 消息 | 保持不变 | 保持不变 |
-| Tool Result | 保持不变 | 保持不变 |
-| Assistant 文本 | 保持不变 | 保持不变 |
-| Tool Calls | 保持不变 | 保持不变 |
-| Thinking 块 | 保持不变 | 转换为 `<thinking>...</thinking>` 文本 |
-
----
-
-## 进阶功能
-
-### 流式处理
-
-#### 事件类型
-
-```typescript
-const s = stream(model, context);
-
-for await (const event of s) {
-  switch (event.type) {
-    case 'start':
-      // 流开始
-      console.log(`Using model: ${event.partial.model}`);
-      break;
-      
-    case 'text_start':
-      // 文本块开始
-      break;
-    case 'text_delta':
-      // 文本片段
-      process.stdout.write(event.delta);
-      break;
-    case 'text_end':
-      // 文本块结束
-      break;
-      
-    case 'thinking_start':
-      // Thinking 开始
-      break;
-    case 'thinking_delta':
-      // Thinking 片段
-      process.stdout.write(event.delta);
-      break;
-    case 'thinking_end':
-      // Thinking 结束
-      break;
-      
-    case 'toolcall_start':
-      // 工具调用开始
-      console.log(`[Tool call: ${event.contentIndex}]`);
-      break;
-    case 'toolcall_delta':
-      // 工具参数 (部分流式)
-      const partial = event.partial.content[event.contentIndex];
-      if (partial.type === 'toolCall') {
-        console.log(`[Streaming args for ${partial.name}]`);
-      }
-      break;
-    case 'toolcall_end':
-      // 工具调用完成
-      console.log(`Tool: ${event.toolCall.name}`);
-      console.log(`Args: ${JSON.stringify(event.toolCall.arguments)}`);
-      break;
-      
-    case 'done':
-      // 流结束
-      console.log(`Stop reason: ${event.reason}`);
-      break;
-      
-    case 'error':
-      // 错误
-      console.error(`Error: ${event.error}`);
-      break;
-  }
-}
-
-// 获取最终消息
-const result = await s.result();
-```
-
-#### 部分 JSON 解析
-
-在 `toolcall_delta` 期间，参数是渐进式解析的：
-
-```typescript
-for await (const event of s) {
-  if (event.type === 'toolcall_delta') {
-    const call = event.partial.content[event.contentIndex];
-    
-    if (call.type === 'toolCall') {
-      // BE DEFENSIVE: arguments 可能不完整
-      if (call.arguments?.path) {
-        console.log(`Writing to: ${call.arguments.path}`);
-      }
-      // 字符串可能被截断
-      // 数组可能不完整
-      // 嵌套对象可能部分填充
-    }
-  }
-}
-```
-
-### Thinking/Reasoning
-
-#### 模型支持
-
-| Provider | Model | Reasoning 支持 |
-|----------|-------|---------------|
-| OpenAI | o1, o3, gpt-5 | ✓ |
-| Anthropic | Claude Sonnet 4 | ✓ |
-| Google | Gemini 2.5 | ✓ |
-| xAI | Grok | 部分 |
-| Groq | GPT-OSS | 部分 |
-| Cerebras | GPT-OSS | 部分 |
-
-#### 配置选项
-
-```typescript
-// 简化接口
-await completeSimple(model, context, {
-  reasoning: 'medium'  // minimal | low | medium | high | xhigh
-});
-
-// OpenAI 特定
-await complete(openaiModel, context, {
-  reasoningEffort: 'medium',
-  reasoningSummary: 'detailed'  // Responses API
-});
-
-// Anthropic 特定
-await complete(anthropicModel, context, {
-  thinkingEnabled: true,
-  thinkingBudgetTokens: 8192
-});
-
-// Google 特定
-await complete(googleModel, context, {
-  thinking: {
-    enabled: true,
-    budgetTokens: 8192
-  }
-});
-```
-
-### 工具调用
-
-#### 完整流程
-
-```typescript
-import { validateToolCall } from '@mariozechner/pi-ai';
-
-const tools: Tool[] = [weatherTool, calculatorTool];
-const context: Context = {
-  messages: [{ role: 'user', content: 'What is 25 * 18?' }],
-  tools
-};
-
-const response = await complete(model, context);
-
-// 验证并执行工具
-for (const block of response.content) {
-  if (block.type === 'toolCall') {
-    try {
-      // 验证参数
-      const validatedArgs = validateToolCall(tools, block);
-      
-      // 执行工具
-      const result = await executeMyTool(block.name, validatedArgs);
-      
-      // 添加结果
-      context.messages.push({
-        role: 'toolResult',
-        toolCallId: block.id,
-        toolName: block.name,
-        content: [{ type: 'text', text: result }],
-        isError: false,
-        timestamp: Date.now()
-      });
-    } catch (error) {
-      // 验证失败 - 返回错误让模型重试
-      context.messages.push({
-        role: 'toolResult',
-        toolCallId: block.id,
-        toolName: block.name,
-        content: [{ type: 'text', text: error.message }],
-        isError: true,
-        timestamp: Date.now()
-      });
-    }
-  }
-}
-
-// 继续
-if (hasToolCalls) {
-  const continuation = await complete(model, context);
-}
+const response = await complete(ollamaModel, context, { apiKey: 'dummy' });
 ```
 
 ### 图像输入
 
-#### 带图像的工具结果
-
 ```typescript
 import { readFileSync } from 'fs';
+import { getModel, complete } from '@mariozechner/pi-ai';
 
-context.messages.push({
-  role: 'toolResult',
-  toolCallId: 'tool_xyz',
-  toolName: 'generate_chart',
-  content: [
-    { type: 'text', text: 'Generated chart' },
-    { type: 'image', data: imageBase64, mimeType: 'image/png' }
-  ],
-  isError: false,
-  timestamp: Date.now()
-});
-```
-
-### OAuth 认证
-
-#### 支持 OAuth 的 Provider
-
-- Anthropic (Claude Pro/Max)
-- OpenAI Codex (ChatGPT Plus/Pro)
-- GitHub Copilot
-- Google Gemini CLI
-- Antigravity
-
-#### OAuth 登录
-
-```typescript
-import { 
-  loginGitHubCopilot, 
-  getOAuthApiKey,
-  refreshOAuthToken 
-} from '@mariozechner/pi-ai';
-
-const credentials = await loginGitHubCopilot({
-  onAuth: (url, instructions) => {
-    console.log(`Open: ${url}`);
-  },
-  onProgress: (message) => console.log(message)
-});
-
-// 获取 API Key (自动刷新过期 Token)
-const result = await getOAuthApiKey('github-copilot', authMap);
-if (result) {
-  console.log('API Key:', result.apiKey);
-  console.log('New credentials:', result.newCredentials);
+const model = getModel('openai', 'gpt-4o-mini');
+if (model.input.includes('image')) {
+  const response = await complete(model, {
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'text', text: 'What is in this image?' },
+        { type: 'image', data: readFileSync('image.png').toString('base64'), mimeType: 'image/png' }
+      ]
+    }]
+  });
 }
-```
-
-#### CLI 登录
-
-```bash
-npx @mariozechner/pi-ai login              # 交互式选择
-npx @mariozechner/pi-ai login anthropic    # 指定 Provider
-npx @mariozechner/pi-ai list               # 列出可用 Provider
-```
-
-### 错误处理
-
-#### Abort 请求
-
-```typescript
-import { stream } from '@mariozechner/pi-ai';
-
-const controller = new AbortController();
-// 2秒后取消
-setTimeout(() => controller.abort(), 2000);
-
-const s = stream(model, context, { signal: controller.signal });
-
-for await (const event of s) {
-  if (event.type === 'text_delta') {
-    process.stdout.write(event.delta);
-  } else if (event.type === 'error') {
-    console.log(`${event.reason === 'aborted' ? 'Aborted' : 'Error'}`);
-  }
-}
-
-const response = await s.result();
-if (response.stopReason === 'aborted') {
-  console.log('Partial content:', response.content);
-  console.log('Tokens used:', response.usage);
-}
-```
-
-#### 中断后继续
-
-```typescript
-// 第一次请求被中断
-const controller = new AbortController();
-setTimeout(() => controller.abort(), 2000);
-
-const partial = await complete(model, context, { signal: controller.signal });
-
-// 添加部分响应并继续
-context.messages.push(partial);
-context.messages.push({ role: 'user', content: 'Please continue' });
-
-const continuation = await complete(model, context);
 ```
 
 ---
 
-## 框架对比：PI vs LangChain vs 其他 Coding Agent
+## 框架对比
 
-在选择编程 Agent 框架时，了解各框架的优劣势非常重要。以下从多个维度进行深度对比。
-
-### 框架概览
+### 总览
 
 | 框架 | 开发团队 | 定位 | 核心特点 |
 |------|---------|------|---------|
@@ -965,520 +1032,200 @@ const continuation = await complete(model, context);
 | **LangChain** | LangChain AI | 通用 LLM 应用框架 | 生态丰富、功能全面、学习曲线陡 |
 | **LangGraph** | LangChain AI | Agent 工作流编排 | 图结构、状态管理、复杂编排 |
 | **AutoGPT** | Significant Gravitas | 自主 Agent | 目标驱动、长期规划、自我反思 |
-| **GPT-Engineer** | Anton Osenko | 代码生成 Agent | 提示驱动、快速生成、简单易用 |
 | **Claude Agent** | Anthropic | 官方 Agent 工具 | 深度集成 Claude、官方支持 |
 | **SWE-Agent** | Princeton | 软件工程 Agent | 学术背景、Bug 修复、代码质量 |
-| **OpenManus** | Manus AI | 通用 Agent | 多模态、任务规划、工具调用 |
 
-### 详细对比
-
-#### 1. 架构设计哲学
+### 架构设计哲学
 
 ```mermaid
 mindmap
   root((框架架构))
-    PI[PI]
-      特点["轻量核心", "插件扩展", "终端优先"]
-      优势["快速上手", "灵活定制", "资源友好"]
-    
-    LangChain[LangChain]
-      特点["模块化", "组件丰富", "生态完整"]
-      优势["功能全面", "社区活跃", "企业采用"]
-    
-    AutoGPT[AutoGPT]
-      特点["目标驱动", "自主决策", "循环执行"]
-      优势["自动化程度高", "长期任务", "自我修正"]
-    
-    Claude[Claude Agent]
-      特点["官方集成", "深度优化", "安全设计"]
-      优势["稳定性", "性能", "合规性"]
+    PI
+      轻量核心
+      插件扩展
+      终端优先
+    LangChain
+      模块化
+      组件丰富
+      生态完整
+    AutoGPT
+      目标驱动
+      自主决策
+      循环执行
+    Claude Agent
+      官方集成
+      深度优化
+      安全设计
 ```
 
-**PI 设计哲学：**
-- **不内置**: 子 Agent、计划模式、MCP、权限弹窗、后台 bash、Todo 列表
-- **可扩展**: 全部功能可通过 Extensions/Skills 扩展
-- **轻量核心**: 保持核心最小，按需添加功能
+### 关键维度对比
 
-**LangChain 设计哲学：**
-- **模块化**: 每个功能都是可组合的组件
-- **生态丰富**: 数百个集成、模板、应用
-- **企业友好**: 类型安全、文档完善、商业支持
+| 维度 | PI | LangChain | AutoGPT | Claude Agent |
+|------|-----|-----------|---------|-------------|
+| **语言** | TypeScript | Python/TS | Python | Python |
+| **核心大小** | 小 | 大 | 中 | 中 |
+| **Provider 数** | 20+ | 50+ | 5+ | 1 (Anthropic) |
+| **类型安全** | 强 (TypeBox) | 中 (Zod) | 弱 (JSON) | 中 |
+| **流式粒度** | 完整 (含工具参数) | 部分 | 基础 | 完整 |
+| **Thinking 流式** | ✓ | ✗ | ✗ | ✓ |
+| **会话分支** | ✓ (/tree /fork) | ✗ | ✗ | ✗ |
+| **上下文压缩** | ✓ 自动 | ✗ | ✗ | 部分 |
+| **学习曲线** | 低-中 | 中-高 | 中 | 低 |
+| **冷启动** | 快 (~500ms) | 中 (~800ms) | 慢 (~2s) | 中 |
+| **内存占用** | 低 (~50MB) | 中 (~100MB) | 高 (~200MB) | 中 |
 
-#### 2. Provider 和模型支持
-
-| 框架 | OpenAI | Anthropic | Google | Azure | Bedrock | 本地模型 | 自定义 |
-|------|--------|-----------|--------|-------|---------|---------|--------|
-| **PI** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (Ollama) | ✓ |
-| **LangChain** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| **AutoGPT** | ✓ | ✓ | ✓ | ✗ | ✗ | 有限 | ✗ |
-| **Claude Agent** | ✗ | ✓ (官方) | ✗ | ✗ | ✗ | ✗ | ✗ |
-
-**PI 优势：**
-- 自动模型发现和元数据管理
-- 原生支持 20+ Provider
-- 内置模型能力查询（Vision、Reasoning、Cost）
-- 统一 API，切换 Provider 无感知
-
-**LangChain 优势：**
-- 更多集成（向量数据库、API、工具）
-- 社区贡献的各种 Provider
-- 企业级 Provider 支持
-
-#### 3. 工具系统
-
-```typescript
-// PI: 简洁的 TypeBox 风格
-const tools: Tool[] = [{
-  name: 'get_weather',
-  description: 'Get weather',
-  parameters: Type.Object({
-    city: Type.String()
-  })
-}];
-
-// LangChain: 结构化的工具定义
-const weatherTool = {
-  name: "get_weather",
-  description: "Get weather",
-  parameters: z.object({
-    city: z.string()
-  })
-};
-
-// AutoGPT: JSON 配置风格
-{
-  "name": "get_weather",
-  "description": "Get weather",
-  "parameters": {
-    "type": "object",
-    "properties": {
-      "city": { "type": "string" }
-    }
-  }
-}
-```
-
-| 维度 | PI | LangChain | AutoGPT |
-|------|-----|-----------|---------|
-| **类型安全** | ✓ TypeBox + AJV | ✓ Zod | ✗ JSON Schema |
-| **Schema 验证** | ✓ 自动验证 | ✓ 自动验证 | ✗ 手动 |
-| **工具数量** | 基础 + 扩展 | 丰富 | 有限 |
-| **自定义工具** | ✓ 简单 | ✓ 灵活 | ✓ |
-| **工具描述** | 自动生成 | 手动定义 | JSON 配置 |
-
-**PI 工具系统特点：**
-- TypeBox Schema 提供编译时类型检查
-- 自动参数验证
-- 工具参数渐进式流式解析
-- 工具结果支持文本和图像
-
-#### 4. 会话管理
-
-```mermaid
-graph TD
-    A[会话存储] --> B[PI: JSONL 树形结构]
-    A --> C[LangChain: Memory 模块]
-    A --> D[AutoGPT: 任务队列]
-    
-    B --> B1[自动保存 ~/.pi/agent/sessions]
-    B --> B2[支持分支/回溯]
-    B --> B3[上下文压缩]
-    
-    C --> C1[ConversationBufferMemory]
-    C --> C2[EntityMemory]
-    C --> C3[柴油机 Memory]
-    
-    D --> D1[任务列表]
-    D --> D2[目标追踪]
-    D --> D3[自我评估]
-```
-
-| 功能 | PI | LangChain | AutoGPT |
-|------|-----|-----------|---------|
-| **持久化** | ✓ JSONL | ✓ 可配置 | ✓ |
-| **会话历史** | ✓ 完整 | ✓ 灵活 | ✓ 任务级 |
-| **分支/回溯** | ✓ /tree | ✗ | ✗ |
-| **上下文压缩** | ✓ 自动 | ✗ | ✗ |
-| **会话分享** | ✓ HTML 导出 | ✗ | ✗ |
-
-**PI 会话管理特点：**
-- `/tree` 命令支持在会话树中导航
-- `/fork` 创建分支
-- 自动上下文压缩（当接近限制时）
-- 完整历史保留在 JSONL 文件
-
-#### 5. 流式处理
-
-```typescript
-// PI: 丰富的事件类型
-for await (const event of stream(model, context)) {
-  switch (event.type) {
-    case 'text_delta':
-    case 'thinking_delta':
-    case 'toolcall_delta':  // 工具参数也支持流式
-    case 'toolcall_end':
-    case 'done':
-    case 'error':
-  }
-}
-
-// LangChain: 相对简单的流式
-for (const chunk of llm.stream(prompt)) {
-  console.log(chunk);
-}
-```
-
-| 维度 | PI | LangChain | AutoGPT |
-|------|-----|-----------|---------|
-| **事件粒度** | 细粒度 | 中等 | 粗粒度 |
-| **工具流式** | ✓ | 部分 | ✗ |
-| **Thinking 流式** | ✓ | ✗ | ✗ |
-| **Abort 支持** | ✓ | ✓ | ✗ |
-| **部分 JSON** | ✓ | ✗ | ✗ |
-
-**PI 流式处理优势：**
-- `toolcall_delta` 支持流式工具参数
-- 渐进式 JSON 解析，实时 UI 更新
-- Thinking 过程实时可见
-- 完善的 Abort 机制
-
-#### 6. 扩展性
-
-```mermaid
-graph LR
-    subgraph "PI 扩展模型"
-        E1[Extensions] --> T1[自定义工具]
-        E1 --> C1[自定义命令]
-        E1 --> K1[键盘快捷键]
-        E1 --> U1[UI 组件]
-        
-        S[Skills] --> A1[Agent Skills]
-        S --> P1[提示模板]
-        S --> T2[主题]
-    end
-    
-    subgraph "LangChain 扩展"
-        LC1[LCEL] --> C2[链式组合]
-        LC1 --> F1[自定义函数]
-        
-        L[LangGraph] --> G1[图结构]
-        G1 --> W1[工作流]
-    end
-    
-    subgraph "AutoGPT 扩展"
-        A1[Plugins] --> P2[插件系统]
-    end
-```
-
-| 维度 | PI | LangChain | AutoGPT |
-|------|-----|-----------|---------|
-| **自定义工具** | ✓ Extension | ✓ LCEL | ✓ 插件 |
-| **自定义命令** | ✓ Extension | ✗ | ✗ |
-| **UI 扩展** | ✓ Extension | ✗ | ✗ |
-| **工作流** | ✗ | ✓ LangGraph | ✓ |
-| **包管理** | ✓ Pi Packages | ✗ | ✗ |
-| **Skills** | ✓ Agent Skills | ✗ | ✗ |
-
-**PI 扩展能力：**
-- TypeScript Extension API
-- 替换内置工具
-- 自定义编辑器、UI 组件
-- Pi Packages (npm/git 发布)
-- Agent Skills 标准支持
-
-#### 7. 学习曲线
-
-```mermaid
-graph LR
-    A[新手] --> B{选择框架}
-    
-    B -->|快速上手| C[GPT-Engineer]
-    B -->|简单交互| D[PI]
-    B -->|企业应用| E[LangChain]
-    B -->|自主任务| F[AutoGPT]
-    B -->|Claude 深度| G[Claude Agent]
-    
-    C -->|进阶| D
-    D -->|进阶| E
-    E -->|进阶| F
-```
-
-| 框架 | 上手难度 | 文档质量 | 示例丰富度 | 社区支持 |
-|------|---------|---------|-----------|---------|
-| **PI** | ⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐ | ⭐⭐⭐ |
-| **LangChain** | ⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ |
-| **AutoGPT** | ⭐⭐⭐ | ⭐⭐ | ⭐⭐ | ⭐⭐⭐ |
-| **Claude Agent** | ⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐ | ⭐⭐⭐⭐ |
-
-**PI 学习路径：**
-1. 基础使用：`pi "your request"`
-2. 交互模式：快捷键、命令
-3. 技能扩展：Agent Skills
-4. 深度定制：TypeScript Extensions
-5. 包发布：Pi Packages
-
-#### 8. 性能对比
-
-```typescript
-// 假设场景：10轮对话 + 5次工具调用
-
-// PI 性能特点
-const model = getModel('anthropic', 'claude-sonnet-4-20250514');
-// - 冷启动: ~500ms
-// - 流式首字节: ~100ms
-// - 上下文压缩: 自动优化
-// - 内存占用: 低 (~50MB)
-
-// LangChain 性能特点
-const chain = LLMChain({ llm, prompt });
-// - 冷启动: ~800ms
-// - 模块开销: 中等
-// - 优化空间: 大
-// - 内存占用: 中 (~100MB)
-
-// AutoGPT 性能特点
-// - 冷启动: ~2s
-// - 循环开销: 高
-// - 内存占用: 高 (~200MB)
-```
-
-| 维度 | PI | LangChain | AutoGPT |
-|------|-----|-----------|---------|
-| **冷启动** | 快 | 中 | 慢 |
-| **内存占用** | 低 | 中 | 高 |
-| **流式效率** | 高 | 中 | 低 |
-| **上下文优化** | ✓ 自动 | ✗ | ✗ |
-
-#### 9. 适用场景
+### 适用场景推荐
 
 | 场景 | 推荐框架 | 原因 |
 |------|---------|------|
-| **日常编程** | PI | 快速、简洁、工具齐全 |
-| **快速原型** | GPT-Engineer | 提示驱动、一键生成 |
-| **复杂应用** | LangChain | 生态丰富、模块化 |
-| **企业系统** | LangChain | 类型安全、文档完善 |
-| **自主研究** | AutoGPT | 目标驱动、长期任务 |
-| **Claude 深度** | Claude Agent | 官方集成、性能优化 |
-| **学术研究** | PI / LangChain | 代码可控、社区活跃 |
-| **多模态任务** | OpenManus | 原生支持 |
-| **Bug 修复** | SWE-Agent | 学术优化 |
+| 日常编程助手 | PI | 快速、简洁、工具齐全 |
+| 复杂企业应用 | LangChain | 生态丰富、模块化、商业支持 |
+| 自主长期任务 | AutoGPT | 目标驱动、自我反思 |
+| Claude 深度集成 | Claude Agent | 官方优化、性能最佳 |
+| 学术 Bug 修复 | SWE-Agent | 专业优化 |
+| 多 Provider 切换 | PI | 统一抽象、切换无感知 |
 
-#### 10. 代码示例对比
+---
 
-**任务：实现一个天气查询工具**
+## 迁移指南
 
-```typescript
-// PI 风格
-import { Type, complete, Tool } from '@mariozechner/pi-ai';
-
-const weatherTool: Tool = {
-  name: 'get_weather',
-  description: 'Get weather for a city',
-  parameters: Type.Object({
-    city: Type.String({ description: 'City name' })
-  })
-};
-
-const response = await complete(model, {
-  messages: [{ role: 'user', content: 'What is the weather in Tokyo?' }],
-  tools: [weatherTool]
-});
-```
+### 从 LangChain 迁移到 PI
 
 ```typescript
-// LangChain 风格
-import { z } from 'zod';
-import { ChatOpenAI } from '@langchain/openai';
-import { HumanMessage, ToolMessage } from '@langchain/core/messages';
-import { tool } from '@langchain/core/tools';
-
-const getWeather = tool(async ({ city }) => {
-  return `Weather in ${city}: Sunny, 25°C`;
-}, {
-  name: 'get_weather',
-  description: 'Get weather for a city',
-  schema: z.object({
-    city: z.string().describe('City name')
-  })
-});
-
-const model = new ChatOpenAI({ model: 'gpt-4o' }).bindTools([getWeather]);
-const messages = [new HumanMessage('What is the weather in Tokyo?')];
-const response = await model.invoke(messages);
-```
-
-```python
-# AutoGPT 风格 (Python)
-from autogpt import Agent
-
-agent = Agent(
-    name="WeatherAgent",
-    role="Weather information assistant",
-    goals=["Get weather information"]
-)
-
-# AutoGPT 会自动分解任务
-# 1. 分析目标
-# 2. 制定计划
-# 3. 执行工具
-# 4. 评估结果
-# 5. 迭代优化
-```
-
-### 选择建议
-
-```mermaid
-decisionDiagram
-    A{你的需求} --> B{优先级是什么?}
-    
-    B -->|简洁快速| C{需要长期运行?}
-    B -->|功能丰富| D{企业级应用?}
-    B -->|深度定制| E{使用 Claude?}
-    
-    C -->|是| F[AutoGPT]
-    C -->|否| G[PI]
-    
-    D -->|是| H[LangChain]
-    D -->|否| I[PI / GPT-Engineer]
-    
-    E -->|是| J[Claude Agent]
-    E -->|否| K{复杂度?}
-    
-    K -->|高| L[LangGraph]
-    K -->|低| M[PI]
-```
-
-#### 选 PI 的理由
-
-1. **轻量高效**：资源占用低，启动快
-2. **极简设计**：核心功能精简，不臃肿
-3. **强扩展性**：按需扩展，不强制功能
-4. **TypeScript 优先**：类型安全，IDE 支持好
-5. **专注编程**：内置工具专为代码任务设计
-6. **开源可控**：代码透明，可深度定制
-7. **活跃维护**：作者亲自维护，响应快
-
-#### 选 LangChain 的理由
-
-1. **生态完整**：数百个集成，开箱即用
-2. **社区庞大**：问题易解决，资源丰富
-3. **企业验证**：大量生产环境使用
-4. **模块灵活**：按需组合，自由度高
-5. **文档完善**：官方文档详细，教程丰富
-6. **商业支持**：LangChain AI 公司提供支持
-
-#### 选 AutoGPT 的理由
-
-1. **自主性强**：目标驱动，无需人工干预
-2. **自我反思**：能评估和修正错误
-3. **长期任务**：适合复杂的多步骤任务
-4. **探索能力**：能自主发现和尝试工具
-
-### 迁移指南
-
-**从 LangChain 迁移到 PI：**
-
-```typescript
-// LangChain 旧代码
+// ❌ LangChain
 import { ChatOpenAI } from '@langchain/openai';
 const llm = new ChatOpenAI({ model: 'gpt-4o' });
+const response = await llm.invoke([new HumanMessage('Hello')]);
 
-// PI 新代码
-import { getModel } from '@mariozechner/pi-ai';
-const model = getModel('openai', 'gpt-4o-mini');  // 或任何模型
+// ✅ PI
+import { getModel, complete } from '@mariozechner/pi-ai';
+const model = getModel('openai', 'gpt-4o-mini');
+const response = await complete(model, {
+  messages: [{ role: 'user', content: 'Hello' }]
+});
 ```
 
-**从 AutoGPT 迁移到 PI：**
+**工具定义迁移：**
+
+```typescript
+// ❌ LangChain (Zod)
+import { z } from 'zod';
+const schema = z.object({ city: z.string().describe('City name') });
+
+// ✅ PI (TypeBox)
+import { Type } from '@mariozechner/pi-ai';
+const schema = Type.Object({ city: Type.String({ description: 'City name' }) });
+```
+
+### 从 AutoGPT 迁移到 PI
 
 ```python
-# AutoGPT 旧代码 (Python)
+# ❌ AutoGPT (Python)
 from autogpt import Agent
 agent = Agent(name="Coder", role="Write code")
-
-# PI 新代码 (TypeScript)
-import { createAgentSession } from '@mariozechner/pi-coding-agent';
-const { session } = await createAgentSession({...});
-await session.prompt("Write a web server");
 ```
 
-### 总结对比表
-
-| 特性 | PI | LangChain | AutoGPT |
-|------|-----|-----------|---------|
-| **语言** | TypeScript | Python/TS | Python |
-| **核心大小** | 小 | 大 | 中 |
-| **Provider 数** | 20+ | 50+ | 5+ |
-| **工具数量** | 基础+扩展 | 丰富 | 有限 |
-| **流式支持** | 完整 | 部分 | 基础 |
-| **类型安全** | 强 | 中 | 弱 |
-| **会话管理** | 完整 | 模块化 | 任务级 |
-| **扩展机制** | Extensions | LCEL | 插件 |
-| **学习曲线** | 低-中 | 中-高 | 中 |
-| **社区大小** | 中 | 大 | 中 |
-| **维护活跃** | 高 | 高 | 中 |
-| **开源协议** | MIT | MIT | MIT |
-| **适合场景** | 编程/Agent | 通用应用 | 自主任务 |
+```typescript
+// ✅ PI (TypeScript)
+import { createAgentSession } from '@mariozechner/pi-coding-agent';
+const { session } = await createAgentSession({ /* ... */ });
+await session.prompt("Write a web server");
+```
 
 ---
 
 ## 常见问题
 
-### Q1: 什么是 Context Window 和 Max Tokens?
+### Q1: Context Window 和 Max Tokens 是什么？
 
-- **Context Window**: 模型能处理的总 token 数（输入 + 输出）
-- **Max Tokens**: 单次响应能输出的最大 token 数
+- **Context Window**：模型能处理的总 Token 数（输入 + 输出）
+- **Max Tokens**：单次响应能输出的最大 Token 数
 
 ```typescript
-// 例如 Claude Sonnet 4
-model.contextWindow === 200000  // 20万 tokens 上下文
-model.maxTokens === 8192        // 单次最多输出 8192 tokens
+model.contextWindow === 200000  // 20 万 Tokens 上下文 (Claude Sonnet 4)
+model.maxTokens === 8192        // 单次最多输出 8192 Tokens
 ```
 
-### Q2: 工具调用失败怎么办?
+OpenClaw 的上下文窗口解析链会根据配置自动调整有效窗口大小，并在低于 16,000 时阻断请求、低于 32,000 时发出警告。
 
-1. 检查 Schema 定义是否正确
-2. 使用 `validateToolCall` 验证参数
-3. 返回结构化错误信息让模型重试
+### Q2: 如何管理上下文窗口？
 
-### Q3: 如何降低成本?
+OpenClaw 提供多层保护：
+
+1. **resolveContextWindowInfo()** — 多来源解析有效窗口大小
+2. **evaluateContextWindowGuard()** — 最小值保护和警告
+3. **compactionSafeguardExtension** — 接近上限时自动压缩
+4. **contextPruningExtension** — 基于 cache-ttl 修剪过期内容
+
+在 `openclaw.yml` 中配置：
+
+```yaml
+agents:
+  defaults:
+    contextTokens: 128000
+    compaction:
+      maxHistoryShare: 0.7
+      recentTurnsPreserve: 3
+      qualityGuard:
+        enabled: true
+        maxRetries: 2
+    contextPruning:
+      mode: cache-ttl
+```
+
+### Q3: 如何降低成本？
 
 ```typescript
 // 1. 使用更便宜的模型
 const model = getModel('openai', 'gpt-4o-mini');
 
-// 2. 启用提示缓存 (长上下文场景)
-context.messages.push({
-  role: 'user',
-  content: [
-    { type: 'text', text: longSystemPrompt },
-    { type: 'text', text: shortQuery }
-  ]
-});
-
-// 3. 减少 Thinking 预算
+// 2. 减少 Thinking 预算
 await completeSimple(model, context, { reasoning: 'minimal' });
+
+// 3. 利用缓存 (长上下文场景，Provider 侧自动缓存)
+// Anthropic 和 Google 支持 Prompt Caching
+
+// 4. 启用上下文修剪，减少重复的工具结果
+// 配置 contextPruning.mode: "cache-ttl"
 ```
 
-### Q4: Provider 之间如何选择?
+### Q4: Provider 之间如何选择？
 
-| 场景 | 推荐 Provider |
-|------|--------------|
-| 编程任务 | Anthropic Claude |
-| 快速响应 | Groq / xAI |
-| 多模态 (图像) | OpenAI GPT-4o |
-| 低成本 | MiniMax / Kimi |
-| 企业合规 | Azure / Bedrock |
+| 场景 | 推荐 Provider | 原因 |
+|------|--------------|------|
+| 编程任务 | Anthropic Claude | 代码能力强，长上下文 |
+| 快速响应 | Groq / Cerebras | 推理速度快 |
+| 多模态 (图像) | OpenAI GPT-4o / Google Gemini | Vision 能力强 |
+| 低成本 | MiniMax / Kimi / gpt-4o-mini | 价格低 |
+| 企业合规 | Azure / Bedrock | 数据合规、私有部署 |
+| 免费使用 | GitHub Copilot | 绑定 Copilot 订阅 |
 
-### Q5: 如何调试?
+### Q5: 如何调试？
 
 ```typescript
-// 打印 Provider Payload
+// 打印发送给 Provider 的完整 Payload
 await complete(model, context, {
   onPayload: (payload) => {
     console.log(JSON.stringify(payload, null, 2));
   }
 });
 ```
+
+OpenClaw 的 verbose level 可以输出更多调试信息：
+
+```yaml
+agents:
+  defaults:
+    verboseLevel: debug  # off | info | debug
+```
+
+### Q6: Thinking Level 不支持怎么办？
+
+不需要手动处理。OpenClaw 的 `pickFallbackThinkingLevel()` 会自动解析错误消息，找到 Provider 支持的 thinking level 并重试。降级顺序依赖于 Provider 错误消息中列出的支持值，最终回退到 `"off"`。
+
+### Q7: GitHub Copilot Token 过期了怎么办？
+
+不需要手动处理。`scheduleCopilotRefresh()` 会在 Token 过期前自动刷新。即使刷新失败也会重试。如果请求遇到认证错误，`maybeRefreshCopilotForAuthError()` 会自动触发刷新并重试请求。
 
 ---
 
@@ -1489,91 +1236,26 @@ await complete(model, context, {
 - [PI Mono Repo](https://github.com/badlogic/pi-mono)
 - [PI AI NPM](https://www.npmjs.com/package/@mariozechner/pi-ai)
 - [PI Coding Agent NPM](https://www.npmjs.com/package/@mariozechner/pi-coding-agent)
-- [Shitty Coding Agent](https://shittycodingagent.ai) - PI 官网
+- [Shitty Coding Agent](https://shittycodingagent.ai) — PI 官网
 
 ### 文档
 
 - [PI AI README](../../node_modules/@mariozechner/pi-ai/README.md)
 - [PI Coding Agent README](../../node_modules/@mariozechner/pi-coding-agent/README.md)
-- [OpenClaw GitHub](https://github.com/openclaw/openclaw)
 
-### 相关标准
+### 关键源码文件
 
-- [Agent Skills 标准](https://agentskills.io)
-- [OpenAI API](https://platform.openai.com/docs)
-- [Anthropic API](https://docs.anthropic.com)
-
----
-
-## 总结
-
-PI 是一个设计精良的 Agent 框架，尤其适合编程任务和 Agent 应用开发：
-
-### 核心优势
-
-1. **轻量高效**：核心精简，资源占用低，启动快
-2. **统一抽象**：通过 `pi-ai` 提供 Provider/Model 的统一接口
-3. **类型安全**：完整的 TypeScript 类型支持，TypeBox Schema 验证
-4. **流式处理**：丰富的事件系统，支持工具参数流式解析
-5. **可扩展**：支持自定义 Provider、Tools、Extensions、Pi Packages
-6. **跨平台**：Node.js 和 Browser 环境都支持
-7. **会话管理**：树形历史、分支回溯、自动压缩
-
-### 框架对比总结
-
-| 维度 | PI 定位 |
-|------|---------|
-| **vs LangChain** | 更轻量、更专注编程、学习曲线更低 |
-| **vs AutoGPT** | 更可控、不强制自主执行、更轻量 |
-| **vs Claude Agent** | 更多 Provider 选择、更灵活 |
-| **vs GPT-Engineer** | 更交互式、更可定制 |
-
-### 掌握 PI 的关键
-
-- **Context**: 对话上下文，可序列化，支持跨 Provider 传输
-- **Tools**: 基于 TypeBox 的类型安全工具定义
-- **Providers**: 支持 20+ LLM 提供商，切换无感知
-- **Events**: 流式事件的细粒度控制
-- **Session**: 持久化的对话历史管理，支持分支和压缩
-- **Extensions**: TypeScript 扩展机制，按需定制
-
-### 何时选择 PI
-
-✅ 日常编程助手  
-✅ 轻量级 Agent 应用  
-✅ 需要多 Provider 切换的场景  
-✅ 对性能和资源有要求  
-✅ 喜欢极简设计的开发者  
-✅ 需要深度定制的场景  
-
-### 何时考虑其他框架
-
-⚠️ 需要丰富的向量数据库集成 → LangChain  
-⚠️ 需要复杂的工作流编排 → LangGraph  
-⚠️ 需要完全自主的长期任务 → AutoGPT  
-⚠️ 只用 Claude 且需要深度优化 → Claude Agent  
+| 文件 | 职责 |
+|------|------|
+| `openclaw/src/agents/pi-embedded-runner/run.ts` | Agent 运行主循环、Copilot 刷新、Thinking 降级 |
+| `openclaw/src/agents/pi-embedded-runner/run/attempt.ts` | 单次 attempt 执行、Session 创建、事件订阅 |
+| `openclaw/src/agents/pi-embedded-runner/extensions.ts` | Extension 工厂构建 |
+| `openclaw/src/agents/pi-embedded-runner/tool-split.ts` | 工具分拆策略 |
+| `openclaw/src/agents/pi-embedded-subscribe.ts` | PI Session 事件订阅桥接 |
+| `openclaw/src/agents/pi-embedded-helpers/thinking.ts` | Thinking Level 降级逻辑 |
+| `openclaw/src/agents/context-window-guard.ts` | Context Window 解析与保护 |
+| `openclaw/src/agents/pi-extensions/compaction-safeguard.ts` | 压缩保护扩展 |
 
 ---
 
-## 附录：核心概念速查
-
-```typescript
-// 快速参考
-
-import { 
-  // 模型获取
-  getModel, getModels, getProviders,
-  // 核心函数
-  stream, complete, streamSimple, completeSimple,
-  // 类型
-  Context, Tool, AssistantMessage,
-  // 工具定义
-  Type, StringEnum,
-  // 工具验证
-  validateToolCall,
-  // 会话管理
-  createAgentSession, SessionManager
-} from '@mariozechner/pi-ai';
-```
-
-祝你使用愉快！🚀
+*基于 OpenClaw v2026.2.3-1 源码分析*

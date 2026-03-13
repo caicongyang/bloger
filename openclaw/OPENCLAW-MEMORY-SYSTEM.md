@@ -1,76 +1,65 @@
 # OpenClaw 记忆系统源码深度分析
 
-> 基于源码的全面解析，帮助你深入理解 OpenClaw 的记忆机制
-
-## 概述
-
-OpenClaw 的记忆系统是一个**混合检索增强生成 (Hybrid RAG)** 系统，结合了：
-
-1. **向量搜索 (Vector Search)** - 基于语义相似度的检索
-2. **全文搜索 (FTS)** - 基于关键词的精确匹配
-3. **混合评分 (Hybrid Scoring)** - 融合两种搜索结果
-
-### 核心特性
-
-| 特性 | 描述 |
-|------|------|
-| **混合检索** | 向量 + 关键词融合，提高召回率 |
-| **自动同步** | 监听文件变化，自动更新索引 |
-| **增量更新** | 只处理变更的文件，避免重复计算 |
-| **多源支持** | 支持 `memory` 和 `sessions` 两种来源 |
-| **嵌入缓存** | 避免重复计算相同内容的 Embedding |
-| **SQLite 存储** | 轻量级本地数据库，无需额外服务 |
-
-### 系统定位
-
-```mermaid
-graph TB
-    subgraph "OpenClaw Agent"
-        A[用户消息] --> B[Agent Session]
-        B --> C[记忆系统]
-        C --> D[Hybrid Search]
-        D --> E[向量搜索]
-        D --> F[FTS 关键词搜索]
-        E --> G[结果融合]
-        F --> G
-        G --> H[返回上下文]
-        H --> B
-        B --> I[LLM 响应]
-    end
-    
-    subgraph "记忆存储"
-        J[SQLite 数据库]
-        K[memory 目录]
-        L[sessions 目录]
-        J --> M[chunks 表]
-        J --> N[files 表]
-        J --> O[embedding_cache 表]
-    end
-```
+> 基于源码逐行拆解，深入理解 OpenClaw 记忆系统的每一个核心细节
 
 ---
 
-## 架构设计
+## 设计理念
+
+OpenClaw 的记忆系统围绕三大设计原则构建：
+
+### Hybrid RAG — 混合检索增强生成
+
+结合两种互补的检索策略以最大化召回率：
+
+| 维度 | 向量搜索 (Semantic) | 全文搜索 (FTS5 BM25) |
+|------|---------------------|----------------------|
+| 匹配方式 | 语义相似度 (余弦距离) | 关键词精确匹配 |
+| 擅长场景 | 近义词、跨语言、模糊意图 | 精确名称、代码标识符、技术术语 |
+| 依赖 | Embedding Provider | SQLite FTS5 模块 |
+
+两者的结果通过 **Hybrid Scoring** 加权融合（默认向量 70% + 关键词 30%），兼顾语义理解和精确匹配。
+
+### Local-first — 本地优先
+
+- **SQLite + sqlite-vec**：全部数据存储在本地 SQLite 数据库，向量索引通过 `sqlite-vec` 扩展实现
+- 无需云端服务、无需 Pinecone/Weaviate 等外部向量数据库
+- 数据完全留在用户本地，保障隐私
+
+### Incremental Sync — 增量同步
+
+- **chokidar** 文件监听器实时感知文件变更
+- **hash-based** 变更检测：只有文件内容 hash 变化时才重新索引
+- **Session delta** 阈值：会话文件按字节增量 (`deltaBytes`) 和消息增量 (`deltaMessages`) 触发同步，配合 5 秒防抖
+
+---
+
+## 架构概览
 
 ### 核心模块结构
 
 ```
 src/memory/
-├── index.ts                    # 导出入口
-├── types.ts                    # 类型定义
-├── schema.ts                   # SQLite Schema
-├── manager.ts                  # 核心管理器 (MemoryIndexManager)
-├── search-manager.ts           # 搜索管理器 (MemorySearchManager)
-├── manager-search.ts           # 搜索算法实现
-├── hybrid.ts                   # 混合搜索融合
-├── internal.ts                 # 内部工具函数
-├── embeddings.ts               # Embedding 提供商
-├── embeddings-openai.ts        # OpenAI Embeddings
-├── embeddings-gemini.ts       # Gemini Embeddings
-├── embeddings-voyage.ts       # Voyage AI Embeddings
-├── backend-config.ts           # 后端配置
-├── qmd-manager.ts             # QMD 后端实现
-└── sync-*.ts                  # 文件同步逻辑
+├── manager.ts              # MemoryIndexManager — 核心管理器
+├── search-manager.ts       # MemorySearchManager 工厂 + 接口定义
+├── manager-search.ts       # 搜索算法实现 (searchVector / searchKeyword)
+├── hybrid.ts               # 混合搜索融合、FTS 查询构建、MMR、时间衰减
+├── internal.ts             # chunkMarkdown()、hashText()、工具函数
+├── embeddings.ts           # Embedding 提供商注册与路由
+├── embeddings-openai.ts    # OpenAI Embeddings
+├── embeddings-gemini.ts    # Gemini Embeddings
+├── embeddings-voyage.ts    # Voyage AI Embeddings
+├── embeddings-mistral.ts   # Mistral Embeddings
+├── embeddings-ollama.ts    # Ollama (本地) Embeddings
+├── embeddings-local.ts     # node-llama-cpp 本地推理
+├── schema.ts               # SQLite Schema 定义
+├── types.ts                # 类型定义
+├── session-files.ts        # Session JSONL → 文本 扁平化
+├── sync-memory.ts          # memory 目录同步
+├── sync-sessions.ts        # sessions 目录同步
+├── fallback.ts             # FallbackMemoryManager 故障转移
+├── backend-config.ts       # 后端配置解析
+└── qmd-manager.ts          # QMD 远程后端
 ```
 
 ### 组件交互关系
@@ -85,735 +74,658 @@ classDiagram
         +sync(params)
         +probeEmbeddingAvailability()
     }
-    
+
     class MemoryIndexManager {
-        <<implements MemorySearchManager>>
+        <<implements>>
         -db: DatabaseSync
         -provider: EmbeddingProvider
         -vector: VectorConfig
         -fts: FTSConfig
+        -watcher: FSWatcher
         +search(query, opts)
+        +sync(params)
         +readFile(params)
         +status()
-        +sync(params)
     }
-    
+
     class FallbackMemoryManager {
-        <<implements MemorySearchManager>>
+        <<implements>>
         -primary: MemorySearchManager
+        -fallbackFactory: Function
         -fallback: MemorySearchManager
+        -primaryFailed: boolean
         +search(query, opts)
     }
-    
-    MemorySearchManager <|-- MemoryIndexManager
-    MemorySearchManager <|-- FallbackMemoryManager
+
+    class QmdMemoryManager {
+        <<implements>>
+        -endpoint: string
+        +search(query, opts)
+    }
+
+    MemorySearchManager <|.. MemoryIndexManager
+    MemorySearchManager <|.. FallbackMemoryManager
+    MemorySearchManager <|.. QmdMemoryManager
+    FallbackMemoryManager --> MemorySearchManager : primary
+    FallbackMemoryManager --> MemorySearchManager : fallback
+```
+
+### 端到端数据流
+
+```mermaid
+flowchart TB
+    subgraph Input["数据输入"]
+        M["memory/ 目录<br/>(Markdown 文件)"]
+        S["sessions/ 目录<br/>(JSONL 会话文件)"]
+    end
+
+    subgraph Sync["增量同步"]
+        W["chokidar 文件监听"]
+        HD["hash-based 变更检测"]
+        SD["session delta 阈值"]
+    end
+
+    subgraph Indexing["索引构建"]
+        CK["chunkMarkdown()<br/>行级分块"]
+        SC["buildSessionEntry()<br/>JSONL 扁平化"]
+        EB["Embedding 计算<br/>(batch API + 缓存)"]
+    end
+
+    subgraph Storage["SQLite 存储"]
+        FT["files 表"]
+        CT["chunks 表"]
+        FTS["chunks_fts (FTS5)"]
+        VEC["chunks_vec (vec0)"]
+        EC["embedding_cache 表"]
+    end
+
+    subgraph Search["混合搜索"]
+        VS["向量搜索<br/>vec_distance_cosine"]
+        KS["FTS 关键词搜索<br/>BM25"]
+        MG["mergeHybridResults()<br/>加权融合"]
+        TD["Temporal Decay<br/>时间衰减"]
+        MMR["MMR 多样性<br/>Jaccard 去重"]
+    end
+
+    M --> W --> HD --> CK
+    S --> W --> SD --> SC
+    CK --> EB
+    SC --> EB
+    EB --> CT & FTS & VEC
+    EB -.->|缓存命中| EC
+
+    CT --> VS & KS
+    FTS --> KS
+    VEC --> VS
+    VS --> MG
+    KS --> MG
+    MG --> TD --> MMR --> R["Top-N 结果"]
 ```
 
 ---
 
-## 核心组件详解
+## Chunking 算法
 
-### MemoryIndexManager
+> **重要纠正**：旧版文档将分块描述为基于 token 估算的句子级分割，这是不准确的。实际实现为**基于字符数的行级分割**。
 
-`MemoryIndexManager` 是记忆系统的核心实现类，负责：
+### 源码：`internal.ts → chunkMarkdown()`
 
-1. **索引管理** - 维护 SQLite 数据库
-2. **文件同步** - 监听文件变化
-3. **分块处理** - 将文件分割为 chunks
-4. **嵌入计算** - 调用 LLM 生成向量
-5. **混合搜索** - 协调向量和关键词搜索
+核心逻辑如下：
 
-#### 核心属性
+**1. 字符数计算（非 token 计数）**
 
 ```typescript
-class MemoryIndexManager implements MemorySearchManager {
-  // 数据库连接
-  private db: DatabaseSync;
-  
-  // 配置
-  private readonly settings: ResolvedMemorySearchConfig;
-  private readonly provider: EmbeddingProvider;
-  private readonly sources: Set<MemorySource>;
-  
-  // 向量搜索配置
-  private readonly vector: {
-    enabled: boolean;
-    available: boolean | null;
-    extensionPath?: string;
-    dims?: number;
-  };
-  
-  // FTS 配置
-  private readonly fts: {
-    enabled: boolean;
-    available: boolean;
-  };
-  
-  // 文件监听
-  private watcher: FSWatcher | null = null;
-  private dirty = false;
-}
+const maxChars = Math.max(32, chunking.tokens * 4);
+const overlapChars = Math.max(0, chunking.overlap * 4);
 ```
 
-#### 搜索流程
+以默认配置 `tokens=400, overlap=80` 为例：
+- `maxChars = 1600` 字符
+- `overlapChars = 320` 字符
+
+**2. 行级分割（非句子级）**
+
+```
+输入文本按 '\n' 拆分为行数组
+for each line:
+    if 当前 chunk 字符数 + line 长度 > maxChars:
+        保存当前 chunk
+        以前一个 chunk 的最后 overlapChars 个字符作为新 chunk 的开头
+    else:
+        追加 line 到当前 chunk
+```
+
+**3. 长行处理**
+
+当单行长度超过 `maxChars` 时，按 `maxChars` 字符强行截断拆分为多个 segment。
+
+**4. 重叠机制**
+
+Overlap 不是行级重叠，而是**字符级**：从前一个 chunk 的文本末尾取最后 `overlapChars` 个字符，拼接到新 chunk 的开头，确保语义连贯性。
+
+**5. Chunk ID 生成**
+
+```typescript
+id = hashText(`${source}:${path}:${startLine}:${endLine}:${hash}:${model}`)
+```
+
+通过源类型、文件路径、行范围、内容 hash 和模型名称的组合哈希生成全局唯一 ID。相同内容 + 相同模型 = 相同 ID，天然支持去重。
+
+### 分块示意
+
+```
+┌───────────────────────────────────────────────┐
+│  MEMORY.md (假设 maxChars=1600)               │
+├───────────────────────────────────────────────┤
+│  Line 1-12: 内容约 1500 chars                  │ → Chunk 1 (startLine=1, endLine=12)
+│  ─── overlap: 最后 320 chars ───               │
+│  Line 8-20: 内容约 1400 chars                  │ → Chunk 2 (startLine=8, endLine=20)
+│  ─── overlap: 最后 320 chars ───               │
+│  Line 17-25: 内容约 800 chars                  │ → Chunk 3 (startLine=17, endLine=25)
+└───────────────────────────────────────────────┘
+```
+
+---
+
+## Session File Chunking
+
+> **新增内容**：旧版文档完全缺失对会话文件处理的描述。
+
+### 源码：`session-files.ts → buildSessionEntry()`
+
+会话文件存储为 JSONL 格式（每行一条 JSON 记录）。索引前需要扁平化为可搜索的纯文本。
+
+**处理流程：**
+
+1. **逐行解析 JSONL**：筛选 `type === "message"` 且 `role` 为 `user` 或 `assistant` 的记录
+2. **提取文本内容**：只保留 `content` 中类型为 `text` 的部分
+3. **扁平化格式**：
+
+```
+User: 用户说的话...
+Assistant: 助手的回复...
+User: 另一条消息...
+```
+
+4. **lineMap 映射**：构建 `flattened line index → 原始 JSONL 行号` 的映射表
+5. **remapChunkLines()**：分块后将 chunk 的 `startLine/endLine` 从扁平文本行号映射回原始 JSONL 行号，确保 `memory_get` 读取时能精确定位
+
+### Session Delta 触发机制
+
+不是每次文件变化都重新索引，而是基于阈值：
+
+| 条件 | 说明 |
+|------|------|
+| `deltaBytes` | 文件大小增长超过阈值字节数 |
+| `deltaMessages` | 新增消息数超过阈值条数 |
+| debounce | 5 秒防抖，避免频繁写入时多次触发 |
+
+---
+
+## Embedding 系统
+
+### 支持的提供商
+
+| 提供商 | 模块 | Batch API | 特点 |
+|--------|------|-----------|------|
+| **OpenAI** | `embeddings-openai.ts` | ✅ | `text-embedding-3-small/large`，性价比首选 |
+| **Gemini** | `embeddings-gemini.ts` | ✅ | `gemini-embedding-001`，Google 生态集成 |
+| **Voyage** | `embeddings-voyage.ts` | ✅ | `voyage-2/4-large`，高质量检索向量 |
+| **Mistral** | `embeddings-mistral.ts` | ❌ | `mistral-embed`，欧洲供应商 |
+| **Ollama** | `embeddings-ollama.ts` | ❌ | 本地运行，隐私保护，兼容 OpenAI API |
+| **Local** | `embeddings-local.ts` | ❌ | `node-llama-cpp`，纯本地推理 |
+
+### Batch 处理机制
+
+```
+常量:
+  EMBEDDING_BATCH_MAX_TOKENS = 8000
+  EMBEDDING_INDEX_CONCURRENCY = 4
+```
+
+**执行策略：**
+
+1. 将待嵌入文本按 `EMBEDDING_BATCH_MAX_TOKENS` 分组
+2. 以 `EMBEDDING_INDEX_CONCURRENCY=4` 的并发度并行调用 Batch API
+3. OpenAI / Gemini / Voyage 支持原生 Batch API，单次请求处理多条文本
+4. Mistral / Ollama / Local 回退到同步逐条嵌入
+
+**容错降级：**
+
+```
+连续 2 次 Batch API 失败
+  → 该 provider 的 Batch API 被禁用
+  → 回退到同步逐条嵌入
+  → 不影响后续索引流程
+```
+
+### Embedding 缓存
+
+**缓存表结构：**
+
+```sql
+embedding_cache (
+  provider     TEXT NOT NULL,
+  model        TEXT NOT NULL,
+  provider_key TEXT NOT NULL,
+  hash         TEXT NOT NULL,
+  embedding    TEXT NOT NULL,   -- JSON 序列化的向量
+  dims         INTEGER,
+  updated_at   INTEGER NOT NULL,
+  PRIMARY KEY (provider, model, provider_key, hash)
+)
+```
+
+**缓存逻辑：**
+
+1. 查询时以 `(provider, model, provider_key, hash)` 四元组作为 key
+2. 命中缓存：直接返回，跳过 API 调用
+3. 未命中：调用 API → 存入缓存
+4. **LRU 淘汰**：当缓存条目数超过 `maxEntries` 时，按 `updated_at` 升序删除最久未使用的记录
+
+---
+
+## 向量存储
+
+### sqlite-vec 扩展
+
+```sql
+-- vec0 虚拟表，N 为 embedding 维度
+CREATE VIRTUAL TABLE chunks_vec USING vec0(
+  id TEXT PRIMARY KEY,
+  embedding FLOAT[N]
+);
+
+-- 搜索：余弦距离
+SELECT c.id, c.path, c.start_line, c.end_line, c.text, c.source,
+       vec_distance_cosine(v.embedding, ?) AS dist
+  FROM chunks_vec v
+  JOIN chunks c ON c.id = v.id
+ WHERE c.model = ?
+ ORDER BY dist ASC
+ LIMIT ?
+```
+
+**余弦距离 → 相似度：**
+
+$$
+\text{score} = 1 - \text{vec\_distance\_cosine}(a, b)
+$$
+
+### Fallback：内存计算
+
+当 `sqlite-vec` 扩展加载失败时：
+
+1. 从 `chunks.embedding` 字段读取 JSON 格式的向量
+2. 在内存中逐条计算余弦相似度
+3. 性能较差但功能完整，确保系统不因扩展缺失而中断
+
+---
+
+## 混合搜索算法
+
+### 源码：`hybrid.ts`
+
+根据 Embedding Provider 是否可用，采用不同的搜索路径：
 
 ```mermaid
 flowchart TD
-    A[搜索请求] --> B[获取查询嵌入向量]
-    B --> C{混合搜索?}
-    C -->|是| D[并行向量+关键词]
-    C -->|否| E{向量可用?}
-    E -->|是| F[向量搜索]
-    E -->|否| G[关键词搜索]
-    D --> H[融合结果]
-    F --> H
-    G --> H
-    H --> I[评分排序]
-    I --> J[返回 Top-N]
+    Q["查询输入"] --> CHK{"Embedding<br/>Provider 可用?"}
+
+    CHK -->|否| FTS_ONLY["FTS-Only 模式"]
+    CHK -->|是| HYBRID["Hybrid 模式"]
+
+    FTS_ONLY --> EK1["extractKeywords(query)<br/>提取关键词"]
+    EK1 --> FK["逐关键词 FTS 查询"]
+    FK --> MK["合并结果<br/>(同 chunk 取最高分)"]
+    MK --> RESULT
+
+    HYBRID --> P1["searchKeyword()<br/>BM25 搜索"]
+    HYBRID --> P2["searchVector()<br/>余弦相似度搜索"]
+    P1 --> MERGE["mergeHybridResults()<br/>加权融合"]
+    P2 --> MERGE
+    MERGE --> DECAY["applyTemporalDecay()<br/>时间衰减"]
+    DECAY --> DIV["applyMMR()<br/>多样性去重"]
+    DIV --> RESULT["Top-N 结果"]
 ```
 
-### MemorySearchManager
+### mergeHybridResults() 详解
 
-这是**工厂模式**的实现：
+**合并策略：**
 
-```typescript
-// search-manager.ts
-export async function getMemorySearchManager(params: {
-  cfg: OpenClawConfig;
-  agentId: string;
-}): Promise<MemorySearchManagerResult> {
-  const resolved = resolveMemoryBackendConfig(params);
-  
-  // 尝试 QMD 后端
-  if (resolved.backend === "qmd" && resolved.qmd) {
-    const wrapper = new FallbackMemoryManager({
-      primary: await QmdMemoryManager.create(...),
-      fallbackFactory: async () => {
-        return await MemoryIndexManager.get(params);
-      }
-    });
-    return { manager: wrapper };
-  }
-  
-  // 使用内置索引
-  const manager = await MemoryIndexManager.get(params);
-  return { manager };
-}
-```
+1. **Union by Chunk ID**：将向量搜索和关键词搜索的结果按 chunk ID 合并
+2. 同一 chunk 同时出现在两种结果中时，保留两个分数
+3. 只出现在一种结果中的 chunk，另一种分数设为 0
 
-### FallbackMemoryManager
+**评分公式：**
 
-提供故障转移机制：
+$$
+\text{score} = w_{\text{vector}} \times s_{\text{vector}} + w_{\text{text}} \times s_{\text{text}}
+$$
 
-```typescript
-class FallbackMemoryManager implements MemorySearchManager {
-  private primaryFailed = false;
-  private fallback: MemorySearchManager | null = null;
-  
-  async search(query: string, opts?: {...}) {
-    if (!this.primaryFailed) {
-      try {
-        return await this.deps.primary.search(query, opts);
-      } catch (err) {
-        this.primaryFailed = true;
-        return await this.ensureFallback().search(query, opts);
-      }
-    }
-  }
-}
-```
+默认权重：$w_{\text{vector}} = 0.7$，$w_{\text{text}} = 0.3$
+
+**计算示例：**
+
+| Chunk | Vector Score | Text Score | Hybrid Score |
+|-------|-------------|------------|--------------|
+| A | 0.90 | 0.60 | 0.7×0.90 + 0.3×0.60 = **0.81** |
+| B | 0.00 | 0.85 | 0.7×0.00 + 0.3×0.85 = **0.255** |
+| C | 0.75 | 0.00 | 0.7×0.75 + 0.3×0.00 = **0.525** |
 
 ---
 
-## 数据结构与 Schema
+## FTS 查询构建
 
-### SQLite Schema 设计
-
-```mermaid
-erDiagram
-    meta ||--o{ files : tracks
-    meta ||--o{ chunks : indexes
-    files ||--o{ chunks : contains
-    
-    meta { string key PK string value }
-    files { string path PK string source string hash integer mtime integer size }
-    chunks { string id PK string path FK string source integer start_line integer end_line string hash string model string text string embedding integer updated_at }
-    embedding_cache { string provider PK string model PK string provider_key PK string hash PK string embedding integer dims integer updated_at }
-```
-
-### Schema 源码
+### Token 化
 
 ```typescript
-// memory-schema.ts
-export function ensureMemoryIndexSchema(params: {
-  db: DatabaseSync;
-  embeddingCacheTable: string;
-  ftsTable: string;
-  ftsEnabled: boolean;
-}) {
-  // 1. Meta 表
-  db.exec(`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
-  
-  // 2. Files 表 - 追踪源文件
-  db.exec(`CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, source TEXT NOT NULL DEFAULT 'memory', hash TEXT NOT NULL, mtime INTEGER NOT NULL, size INTEGER NOT NULL)`);
-  
-  // 3. Chunks 表 - 存储文本块和嵌入
-  db.exec(`CREATE TABLE IF NOT EXISTS chunks (id TEXT PRIMARY KEY, path TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'memory', start_line INTEGER NOT NULL, end_line INTEGER NOT NULL, hash TEXT NOT NULL, model TEXT NOT NULL, text TEXT NOT NULL, embedding TEXT NOT NULL, updated_at INTEGER NOT NULL)`);
-  
-  // 4. Embedding Cache
-  db.exec(`CREATE TABLE IF NOT EXISTS ${params.embeddingCacheTable} (provider TEXT NOT NULL, model TEXT NOT NULL, provider_key TEXT NOT NULL, hash TEXT NOT NULL, embedding TEXT NOT NULL, dims INTEGER, updated_at INTEGER NOT NULL, PRIMARY KEY (provider, model, provider_key, hash))`);
-  
-  // 5. FTS 全文索引
-  if (params.ftsEnabled) {
-    try {
-      db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS ${params.ftsTable} USING fts5(text, id UNINDEXED, path UNINDEXED, source UNINDEXED, model UNINDEXED, start_line UNINDEXED, end_line UNINDEXED)`);
-    } catch (err) { /* FTS 不可用 */ }
+// 正则：匹配 Unicode 字母、数字、下划线
+const TOKEN_REGEX = /[\p{L}\p{N}_]+/gu;
+```
+
+支持中文、日文、韩文等 Unicode 字符。
+
+### 查询格式
+
+```
+输入: "OpenClaw memory search 记忆"
+Token化: ["OpenClaw", "memory", "search", "记忆"]
+FTS查询: "OpenClaw" AND "memory" AND "search" AND "记忆"
+```
+
+所有 token 之间为 AND 关系，要求每个关键词都必须匹配。
+
+### BM25 分数转换
+
+```typescript
+function bm25RankToScore(rank: number): number {
+  if (rank >= 0) {
+    // rank 为正时（FTS5 的 rank 越小越好，负数表示更相关）
+    return 1 / (1 + rank);
   }
-  
-  // 6. 向量索引
-  db.exec(`CREATE TABLE IF NOT EXISTS chunks_vec (id TEXT PRIMARY KEY, embedding TEXT NOT NULL)`);
+  // rank 为负时（更相关）
+  const relevance = -rank;
+  return relevance / (1 + relevance);
 }
 ```
 
-### 数据类型
-
-```typescript
-// types.ts
-export type MemorySource = "memory" | "sessions";
-
-export type MemorySearchResult = {
-  path: string;           // 文件路径
-  startLine: number;      // 开始行号
-  endLine: number;        // 结束行号
-  score: number;          // 综合评分 (0-1)
-  snippet: string;        // 文本片段 (最多 700 字符)
-  source: MemorySource;   // 数据来源
-  citation?: string;      // 引用标识
-};
-```
+将 FTS5 的 BM25 rank 值（负数 = 更相关）映射到 `[0, 1)` 区间，与向量搜索的余弦相似度在同一尺度上。
 
 ---
 
-## 搜索流程详解
+## Temporal Decay（时间衰减）
 
-### 向量搜索
+### 源码：`hybrid.ts → applyTemporalDecayToHybridResults()`
 
-#### 算法：余弦相似度
+让近期的记忆比旧记忆获得更高的分数加成，模拟自然遗忘曲线。
 
-```typescript
-// manager-search.ts
-export async function searchVector(params: {
-  db: DatabaseSync;
-  queryVec: number[];
-  limit: number;
-}): Promise<SearchRowResult[]> {
-  const rows = params.db
-    .prepare(`
-      SELECT c.id, c.path, c.start_line, c.end_line, c.text, c.source,
-             vec_distance_cosine(v.embedding, ?) AS dist
-        FROM chunks_vec v
-        JOIN chunks c ON c.id = v.id
-       WHERE c.model = ?
-       ORDER BY dist ASC
-       LIMIT ?
-    `)
-    .all(vectorToBlob(params.queryVec), params.providerModel, params.limit);
-  
-  return rows.map(row => ({
-    id: row.id,
-    path: row.path,
-    startLine: row.start_line,
-    endLine: row.end_line,
-    score: 1 - row.dist,  // 余弦距离转相似度
-    snippet: truncateUtf16Safe(row.text, SNIPPET_MAX_CHARS),
-    source: row.source,
-  }));
-}
-```
+### 日期提取规则
 
-#### 余弦相似度公式
+| 文件类型 | 日期来源 |
+|----------|----------|
+| `memory/YYYY-MM-DD.md` | 文件名中的日期 |
+| `memory/2024-01-15-meeting.md` | 文件名中的日期 |
+| 非日期命名文件 | 文件的 `mtime`（最后修改时间） |
+
+### Evergreen 文件（不衰减）
+
+以下文件被标记为"常青"，**不受时间衰减影响**：
+
+- `MEMORY.md` / `memory.md`（根目录长期记忆文件）
+- `memory/*.md` 中不含日期的文件（如 `memory/projects.md`）
+
+### 衰减公式
 
 $$
-\text{similarity}(a, b) = \frac{a \cdot b}{\|a\| \cdot \|b\|} = 1 - \text{cosine\_distance}
+\text{multiplier} = e^{-\lambda \times \text{ageInDays}}
 $$
 
-### 关键词搜索
+其中：
 
-#### 算法：BM25 + FTS5
+$$
+\lambda = \frac{\ln 2}{\text{halfLifeDays}}
+$$
 
-```typescript
-// manager-search.ts
-export async function searchKeyword(params: {
-  db: DatabaseSync;
-  query: string;
-  limit: number;
-}): Promise<SearchRowResult[]> {
-  const ftsQuery = buildFtsQuery(params.query);
-  if (!ftsQuery) return [];
-  
-  const rows = params.db
-    .prepare(`
-      SELECT id, path, source, start_line, end_line, text,
-             bm25(chunks_fts) AS rank
-        FROM chunks_fts
-       WHERE chunks_fts MATCH ? AND model = ?
-       ORDER BY rank ASC
-       LIMIT ?
-    `)
-    .all(ftsQuery, params.providerModel, params.limit);
-  
-  return rows.map(row => ({
-    id: row.id,
-    path: row.path,
-    startLine: row.start_line,
-    endLine: row.end_line,
-    score: bm25RankToScore(row.rank),
-    snippet: truncateUtf16Safe(row.text, SNIPPET_MAX_CHARS),
-    source: row.source,
-  }));
-}
+**含义**：经过 `halfLifeDays` 天后，分数衰减到原来的 50%。
+
+**衰减曲线示例**（halfLifeDays = 30）：
+
+| 天数 | 衰减乘数 |
+|------|----------|
+| 0 天 | 1.000 |
+| 7 天 | 0.851 |
+| 30 天 | 0.500 |
+| 60 天 | 0.250 |
+| 90 天 | 0.125 |
+
+---
+
+## MMR 多样性去重
+
+### 源码：`hybrid.ts → applyMMRToHybridResults()`
+
+**MMR (Maximal Marginal Relevance)** 在保持相关性的同时降低结果的冗余度。
+
+### 算法
+
+$$
+\text{MMR}(d) = \lambda \times \text{relevance}(d) - (1 - \lambda) \times \max_{d_j \in S} \text{similarity}(d, d_j)
+$$
+
+- $d$：候选文档
+- $S$：已选中的结果集
+- $\lambda$：多样性参数（越大越偏向相关性，越小越偏向多样性）
+
+### 相似度度量
+
+采用 **Jaccard 系数**，基于 tokenized snippet 计算：
+
+$$
+J(A, B) = \frac{|A \cap B|}{|A \cup B|}
+$$
+
+**迭代选择过程：**
+
+1. 选择分数最高的结果加入 $S$
+2. 对每个剩余候选，计算其 MMR 值
+3. 选择 MMR 值最高的加入 $S$
+4. 重复直到达到 `maxResults`
+
+---
+
+## Query Expansion 多语言支持
+
+### 源码：`hybrid.ts → extractKeywords()`
+
+`extractKeywords()` 负责从查询中提取有效关键词，内置了多语言停用词和特殊处理逻辑。
+
+### 停用词过滤
+
+支持 7 种语言的停用词表：
+
+| 语言 | 示例停用词 |
+|------|-----------|
+| English | the, is, at, which, on, a, an |
+| Español | el, la, los, las, de, en |
+| Português | o, a, os, as, de, em |
+| العربية | في, من, على, إلى |
+| 中文 | 的, 了, 是, 在, 和, 也 |
+| 한국어 | 은, 는, 이, 가, 를, 을 |
+| 日本語 | の, は, が, を, に, で |
+
+### 特殊语言处理
+
+**CJK (中日韩) 字符 N-gram：**
+
+CJK 文字不以空格分词，使用字符级 n-gram：
+
+```
+输入: "记忆系统"
+输出: ["记忆", "忆系", "系统"]  (bigrams)
 ```
 
-#### FTS 查询构建
+**韩语助词剥离：**
 
-```typescript
-// hybrid.ts
-export function buildFtsQuery(raw: string): string | null {
-  const tokens = raw.match(/[A-Za-z0-9_]+/g)?.map(t => t.trim()).filter(Boolean) ?? [];
-  if (tokens.length === 0) return null;
-  
-  const quoted = tokens.map(t => `"${t.replaceAll('"', "")}"`);
-  return quoted.join(" AND ");
-  
-  // 示例: "openclaw memory search" -> "openclaw AND memory AND search"
-}
+```
+输入: "기억을"  →  "기억" (去掉助词 "을")
 ```
 
-### 混合搜索
+**日语按书写系统分割：**
 
-#### 结果融合
-
-```typescript
-// hybrid.ts
-export function mergeHybridResults(params: {
-  vector: HybridVectorResult[];
-  keyword: HybridKeywordResult[];
-  vectorWeight: number;  // 默认 0.7
-  textWeight: number;     // 默认 0.3
-}): HybridResult[] {
-  const byId = new Map<string, Entry>();
-  
-  for (const r of params.vector) {
-    byId.set(r.id, { ..., vectorScore: r.vectorScore, textScore: 0 });
-  }
-  for (const r of params.keyword) {
-    const existing = byId.get(r.id);
-    if (existing) {
-      existing.textScore = r.textScore;
-    } else {
-      byId.set(r.id, { ..., vectorScore: 0, textScore: r.textScore });
-    }
-  }
-  
-  return Array.from(byId.values()).map(entry => ({
-    ...entry,
-    score: params.vectorWeight * entry.vectorScore + params.textWeight * entry.textScore,
-  })).toSorted((a, b) => b.score - a.score);
-}
+```
+输入: "メモリシステムの検索" 
+→ ["メモリシステム", "検索"]  (按假名/汉字边界分割)
 ```
 
-#### 混合搜索流程
+### 关键词有效性校验 — `isValidKeyword()`
 
-```mermaid
-flowchart LR
-    A[查询] --> V[向量搜索]
-    A --> K[关键词搜索]
-    V --> F[融合]
-    K --> F
-    F --> S[评分排序]
-```
+过滤掉无效的 token：
+- 过短的单词（如单个拉丁字母）
+- 纯数字
+- 仅由标点符号组成的字符串
 
 ---
 
 ## 索引管理
 
-### 文件同步机制
+### 文件同步流程
 
 ```mermaid
 flowchart TD
-    A[文件变化] --> B{新增?}
-    B -->|是| C[添加到 files 表]
-    B -->|否| D{修改?}
-    D -->|是| E[检查 hash]
-    D -->|否| F[忽略]
-    E --> G{hash 变化?}
-    G -->|是| H[重新分块]
-    G -->|否| I[跳过]
-    H --> J[计算 embeddings]
-    J --> K[更新索引]
+    START["chokidar 检测到文件变化"] --> TYPE{"文件类型?"}
+    TYPE -->|memory/*.md| HASH["计算文件 hash"]
+    TYPE -->|sessions/*.jsonl| DELTA["检查 delta 阈值"]
+
+    HASH --> CMP{"hash 与 DB 中一致?"}
+    CMP -->|是| SKIP["跳过"]
+    CMP -->|否| CHUNK["重新分块"]
+
+    DELTA --> DCMP{"超过 deltaBytes<br/>或 deltaMessages?"}
+    DCMP -->|否| SKIP
+    DCMP -->|是| BUILD["buildSessionEntry()<br/>扁平化 JSONL"]
+    BUILD --> CHUNK
+
+    CHUNK --> EMBED["计算 Embedding<br/>(优先缓存)"]
+    EMBED --> WRITE["写入 chunks + FTS + vec"]
+    WRITE --> CLEAN["清理已删除文件的旧索引"]
 ```
 
-### 分块策略
+### 同步触发条件
 
-```typescript
-// internal.ts
-export function chunkMarkdown(params: {
-  content: string;
-  tokens: number;      // 默认 400
-  overlap: number;     // 默认 80
-}): MemoryChunk[] {
-  const chunks: MemoryChunk[] = [];
-  const lines = params.content.split('\n');
-  
-  let currentChunk = "";
-  let currentTokens = 0;
-  
-  for (const line of lines) {
-    const lineTokens = estimateTokens(line);
-    
-    if (currentTokens + lineTokens > params.tokens && currentChunk.length > 0) {
-      chunks.push({ text: currentChunk.trim(), ... });
-      const overlapText = extractOverlap(currentChunk, params.overlap);
-      currentChunk = overlapText + '\n' + line;
-      currentTokens = estimateTokens(overlapText) + lineTokens;
-    } else {
-      currentChunk += line + '\n';
-      currentTokens += lineTokens;
-    }
-  }
-  
-  return chunks;
-}
-```
+| 触发方式 | 说明 |
+|----------|------|
+| **文件监听** | chokidar 监听 memory/ 和 sessions/ 目录 |
+| **定时同步** | `sync.intervalMinutes` 周期性触发 |
+| **手动同步** | `memory_sync` 工具调用 |
+| **配置变更** | provider / model / scope / extraPaths 变化时触发完整重建 |
 
-### 分块示意
+### 重建策略：原子交换
 
-```
-┌─────────────────────────────────────────┐
-│  MEMORY.md 内容                          │
-├─────────────────────────────────────────┤
-│  Line 1: # 概述                          │
-│  Line 2:                                 │
-│  Line 3: 这是内容...                      │
-│  ...                                     │
-├─────────────────────────────────────────┤
-│  Chunk 1 (Lines 1-10)                    │
-│  Chunk 2 (Lines 5-15) ← overlap         │
-│  Chunk 3 (Lines 12-22)                  │
-└─────────────────────────────────────────┘
-```
+当检测到 provider/model 等关键配置变更时，不能在原 DB 上增量更新（维度可能不同），需要：
 
-### Embedding 缓存
-
-```typescript
-class MemoryIndexManager {
-  private async getEmbeddingWithCache(text: string): Promise<number[]> {
-    const hash = hashText(text);
-    
-    // 1. 查找缓存
-    const cached = this.db
-      .prepare(`SELECT embedding FROM embedding_cache WHERE hash = ?`)
-      .get(hash);
-    
-    if (cached) return parseEmbedding(cached.embedding);
-    
-    // 2. 调用 LLM 计算
-    const embedding = await this.provider.embed(text);
-    
-    // 3. 存入缓存
-    this.db
-      .prepare(`INSERT INTO embedding_cache VALUES (?, ?, ?, ?, ?, ?)`)
-      .run(this.provider, this.model, this.providerKey, hash,
-           JSON.stringify(embedding), Date.now());
-    
-    return embedding;
-  }
-}
-```
+1. 创建临时数据库文件
+2. 在临时 DB 中完成全部重新索引
+3. 原子交换（rename）替换旧 DB
+4. 确保在重建过程中旧索引仍可用于搜索
 
 ---
 
-## 记忆存储
+## 故障恢复
 
-### 文件结构
+### SQLITE_READONLY 处理
 
 ```
-~/.openclaw/workspace/
-├── AGENTS.md           # Agent 配置 (自动加载)
-├── SOUL.md             # Agent 身份定义
-├── USER.md             # 用户信息
-├── TOOLS.md            # 工具配置
-├── MEMORY.md           # 长期记忆
-├── memory/             # 记忆文件目录
-│   ├── daily-notes/    # 每日笔记
-│   ├── projects/       # 项目相关
-│   └── ...
-├── sessions/           # 会话历史
-└── [其他项目文件]
+检测到 SQLITE_READONLY 错误
+  → 关闭当前数据库连接
+  → 重新打开数据库
+  → 重试操作
 ```
 
-### 配置示例
+### Embedding Provider 降级
 
-```json
-{
-  "memory": {
-    "sources": ["memory", "sessions"],
-    "extraPaths": ["/path/to/extra"],
-    "provider": "auto",
-    "model": "text-embedding-3-small",
-    "chunking": {
-      "tokens": 400,
-      "overlap": 80
-    },
-    "query": {
-      "maxResults": 6,
-      "minScore": 0.35,
-      "hybrid": {
-        "enabled": true,
-        "vectorWeight": 0.7,
-        "textWeight": 0.3
-      }
-    }
-  }
-}
 ```
+Embedding API 调用失败
+  → activateFallbackProvider()
+  → 切换到备选 provider
+  → 触发全量重建索引（因为 embedding 维度/模型可能不同）
+```
+
+### FallbackMemoryManager
+
+```mermaid
+flowchart LR
+    REQ["搜索请求"] --> CHK{"primary<br/>正常?"}
+    CHK -->|是| P["Primary Manager<br/>(如 QMD)"]
+    CHK -->|否| F["Fallback Manager<br/>(MemoryIndexManager)"]
+    P -->|成功| RES["返回结果"]
+    P -->|异常| MARK["标记 primaryFailed=true"]
+    MARK --> F
+    F --> RES
+```
+
+Primary 一旦失败，后续所有请求直接路由到 Fallback，避免反复超时。
 
 ---
 
-## 配置选项
+## 配置参考
 
 ### 默认值速查表
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
-| `provider` | `"auto"` | 自动选择提供商 |
-| `chunking.tokens` | `400` | 每块最大 token |
-| `chunking.overlap` | `80` | 重叠 token 数 |
-| `query.maxResults` | `6` | 返回结果数 |
-| `query.minScore` | `0.35` | 最小相似度 |
+| `provider` | `"auto"` | 自动选择可用的 Embedding 提供商 |
+| `chunking.tokens` | `400` | 每块最大 token（实际 maxChars = tokens × 4） |
+| `chunking.overlap` | `80` | 重叠 token（实际 overlapChars = overlap × 4） |
+| `query.maxResults` | `6` | 最大返回结果数 |
+| `query.minScore` | `0.35` | 最低相似度阈值 |
 | `query.hybrid.enabled` | `true` | 启用混合搜索 |
-| `query.hybrid.vectorWeight` | `0.7` | 向量权重 |
-| `query.hybrid.textWeight` | `0.3` | 关键词权重 |
-| `sync.watchDebounceMs` | `1500` | 防抖时间 |
-| `cache.enabled` | `true` | 启用缓存 |
+| `query.hybrid.vectorWeight` | `0.7` | 向量搜索权重 |
+| `query.hybrid.textWeight` | `0.3` | 关键词搜索权重 |
+| `sync.intervalMinutes` | — | 定时同步间隔 |
+| `sync.watchDebounceMs` | `1500` | 文件监听防抖 |
+| `cache.maxEntries` | — | Embedding 缓存最大条目数 |
 
-### Embedding 提供商
+### Embedding 提供商对照表
 
-| 提供商 | 模型 | 特点 |
-|--------|------|------|
-| `openai` | `text-embedding-3-small` | 性价比高 |
-| `gemini` | `gemini-embedding-001` | Google 生态 |
-| `voyage` | `voyage-4-large` | 高质量 |
-| `local` | 本地模型 | 隐私保护 |
-| `auto` | 自动选择 | 默认推荐 |
+| 提供商 | 代表模型 | Batch API | 维度 | 特点 |
+|--------|---------|-----------|------|------|
+| OpenAI | `text-embedding-3-small` | ✅ | 1536 | 性价比高，生态成熟 |
+| OpenAI | `text-embedding-3-large` | ✅ | 3072 | 高精度 |
+| Gemini | `gemini-embedding-001` | ✅ | 768 | Google 生态 |
+| Voyage | `voyage-2` / `voyage-4-large` | ✅ | — | 检索场景专用 |
+| Mistral | `mistral-embed` | ❌ | 1024 | 欧洲供应商 |
+| Ollama | 本地模型 | ❌ | 依赖模型 | 本地运行，隐私保护 |
+| Local | node-llama-cpp | ❌ | 依赖模型 | 纯本地，无需网络 |
+
+### 记忆工具
+
+| 工具 | 说明 |
+|------|------|
+| `memory_search` | 语义搜索记忆，参数：`query`, `maxResults?`, `minScore?` |
+| `memory_get` | 读取记忆文件，参数：`path`, `from?`, `lines?` |
 
 ---
 
-## 使用指南
+## 完整搜索管线总结
 
-### 工具调用
+```mermaid
+flowchart TD
+    Q["用户查询"] --> EMB["查询 Embedding"]
+    Q --> KW["extractKeywords()<br/>关键词提取 + 多语言支持"]
 
-#### memory_search - 语义搜索
+    EMB --> VS["searchVector()<br/>sqlite-vec 余弦距离"]
+    KW --> FTS["searchKeyword()<br/>FTS5 BM25"]
 
-```typescript
-export async function memory_search(
-  query: string,
-  maxResults?: number,
-  minScore?: number
-): Promise<MemorySearchResult[]>
-```
+    VS --> MERGE["mergeHybridResults()<br/>score = 0.7·vector + 0.3·text"]
+    FTS --> MERGE
 
-**使用示例：**
-
-```
-搜索: "Tom 的项目信息"
-返回:
-  [
-    {
-      "path": "memory/projects/openclaw.md",
-      "startLine": 10,
-      "endLine": 20,
-      "score": 0.85,
-      "snippet": "Tom 正在开发 OpenClaw...",
-      "source": "memory"
-    }
-  ]
-```
-
-#### memory_get - 读取记忆
-
-```typescript
-// 读取文件
-await memory_get({ path: "memory/daily-notes/2024-01-15.md" });
-
-// 读取行范围
-await memory_get({ path: "memory/projects.md", from: 10, lines: 20 });
-```
-
-### 最佳实践
-
-#### 1. 记忆文件组织
-
-```
-memory/
-├── AGENTS.md           # Agent 核心配置
-├── SOUL.md             # Agent 身份定义
-├── USER.md             # 用户偏好
-├── MEMORY.md           # 长期重要记忆
-├── daily-notes/        # 每日笔记
-│   ├── 2024-01-15.md
-│   └── 2024-01-16.md
-├── projects/           # 项目相关
-│   ├── openclaw.md
-│   └── website.md
-└── preferences/        # 偏好设置
-```
-
-#### 2. 内容格式
-
-```markdown
-# SSH 配置
-
-## 概述
-记录 Tom 的 SSH 配置信息。
-
-## 主机信息
-- 服务器: 192.168.1.100
-- 用户: admin
-- 端口: 22
-
-## 密钥位置
-~/.ssh/id_rsa_openclaw
-```
-
-#### 3. 性能优化
-
-```typescript
-// 减少返回结果
-await memory_search("查询", maxResults=3);
-
-// 提高分数阈值
-await memory_search("查询", minScore=0.5);
-
-// 禁用混合搜索
-{ "memory": { "query": { "hybrid": { "enabled": false } } } }
+    MERGE --> DECAY["applyTemporalDecay()<br/>exp(-λ·age) 时间衰减"]
+    DECAY --> MMR_STEP["applyMMR()<br/>Jaccard 多样性去重"]
+    MMR_STEP --> FILTER["minScore 过滤 + maxResults 截断"]
+    FILTER --> OUT["返回 MemorySearchResult[]<br/>{path, startLine, endLine, score, snippet, source}"]
 ```
 
 ---
 
-## 源码关键代码解读
-
-### 1. 混合搜索入口
-
-```typescript
-// manager.ts
-async search(query: string, opts?: {...}): Promise<MemorySearchResult[]> {
-  const queryVec = await this.provider.embed(query);
-  return await this.hybridSearch(queryVec, opts);
-}
-
-private async hybridSearch(queryVec: number[], opts?: {...}) {
-  const { hybrid } = this.settings.query;
-  
-  if (hybrid.enabled && queryVec.length > 0) {
-    const [vectorResults, keywordResults] = await Promise.all([
-      this.searchVector(queryVec, opts),
-      this.searchKeyword(query, opts),
-    ]);
-    
-    return mergeHybridResults({
-      vector: vectorResults,
-      keyword: keywordResults,
-      vectorWeight: hybrid.vectorWeight,
-      textWeight: hybrid.textWeight,
-    });
-  }
-  
-  return queryVec.length > 0 
-    ? this.searchVector(queryVec, opts)
-    : this.searchKeyword(query, opts);
-}
-```
-
-### 2. 评分计算
-
-```typescript
-// 综合评分公式
-score = vectorWeight × vectorScore + textWeight × textScore
-
-// 示例
-// 向量 0.9 + 关键词 0.6
-// 综合 = 0.7 × 0.9 + 0.3 × 0.6 = 0.81
-```
-
-### 3. 增量同步
-
-```typescript
-// manager.ts
-private async syncFiles(): Promise<void> {
-  const files = await listMemoryFiles(this.memoryDir);
-  
-  for (const file of files) {
-    const currentHash = await hashFile(file.path);
-    const dbHash = this.getFileHash(file.path);
-    
-    if (currentHash !== dbHash) {
-      await this.reindexFile(file);
-    }
-  }
-  
-  this.cleanupDeletedFiles();
-}
-```
-
----
-
-## 常见问题
-
-### Q1: 搜索不到内容？
-
-1. 检查 `memory/` 目录下是否有文件
-2. 确认 `memory_search` 的 `minScore` 不要太高
-3. 运行 `memory_sync` 手动触发同步
-
-### Q2: 性能差？
-
-1. 启用 Embedding 缓存 (`cache.enabled: true`)
-2. 使用 `sqlite-vec` 扩展加速向量搜索
-3. 减少 `chunking.tokens` 增加并行度
-
-### Q3: FTS 不可用？
-
-SQLite 编译时缺少 FTS5 模块，降级到关键词匹配。
-
-### Q4: 如何清除索引？
-
-删除 SQLite 数据库文件：
-```bash
-rm ~/.openclaw/workspace/.memory/index.sqlite
-```
-
-### Q5: 支持哪些 Embedding 模型？
-
-| 提供商 | 模型 |
-|--------|------|
-| OpenAI | `text-embedding-3-small`, `text-embedding-3-large` |
-| Gemini | `gemini-embedding-001` |
-| Voyage | `voyage-2`, `voyage-4-large` |
-| 本地 | 支持 Ollama 等兼容 OpenAI API 的服务 |
-
----
-
-## 总结
-
-OpenClaw 记忆系统核心要点：
-
-1. **混合搜索**: 向量 (70%) + 关键词 (30%) 融合
-2. **SQLite 存储**: 轻量级本地数据库
-3. **自动同步**: 文件变化监听 + 防抖
-4. **增量更新**: 只处理变更文件
-5. **嵌入缓存**: 避免重复计算
-6. **分块策略**: 400 tokens + 80 overlap
-7. **故障转移**: QMD → 内置索引回退
-
-掌握这些，就能高效使用 OpenClaw 的记忆系统！
+*基于 OpenClaw v2026.2.3-1 源码分析*

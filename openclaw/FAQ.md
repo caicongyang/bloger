@@ -1,66 +1,45 @@
-# OpenClaw FAQ - 常见问题解答
+# OpenClaw 常见问题（FAQ）
 
-> 本文档收集 OpenClaw 源码中比较难理解的问题和概念，持续更新。
+> 本文档收集 OpenClaw 源码中比较难理解的问题和概念，基于源码分析持续更新。
 
 ## 目录
 
-- [基础概念](#基础概念)
-- [架构设计](#架构设计)
-- [Agent 运行时](#agent-运行时)
-- [Skills 系统](#skills-系统)
-- [消息系统](#消息系统)
-- [通道系统](#通道系统)
-- [记忆系统](#记忆系统)
-- [工具系统](#工具系统)
-- [安全与沙箱](#安全与沙箱)
-- [部署与配置](#部署与配置)
-- [常见错误排查](#常见错误排查)
+- [1. 基础概念](#1-基础概念) — Q1–Q3
+- [2. 架构与启动](#2-架构与启动) — Q4–Q5
+- [3. Agent 运行时](#3-agent-运行时) — Q6–Q10
+- [4. Skills 系统](#4-skills-系统) — Q11–Q12
+- [5. 消息系统](#5-消息系统) — Q13–Q14
+- [6. 通道系统](#6-通道系统) — Q15–Q16
+- [7. 记忆系统](#7-记忆系统) — Q17–Q18
+- [8. 工具系统](#8-工具系统) — Q19–Q20
+- [9. 安全](#9-安全) — Q21–Q23
+- [10. 配置](#10-配置) — Q24–Q26
+- [11. 部署](#11-部署) — Q27–Q28
+- [12. 排查](#12-排查) — Q29–Q31
 
 ---
 
-## 基础概念
+## 1. 基础概念
 
 ### Q1: OpenClaw 是什么？它和 Claude/ChatGPT 有什么不同？
 
-**Answer:**
-
 OpenClaw 是一个 **AI Agent 运行时框架**，而不仅仅是聊天机器人。
-
-**核心区别：**
 
 | 特性 | OpenClaw | Claude/ChatGPT |
 |------|----------|----------------|
 | **本质** | Agent 运行时框架 | AI 聊天应用 |
-| **交互方式** | 多通道（QQ/微信/Discord/Telegram等） | 仅 Web/App |
+| **交互方式** | 多通道（QQ/微信/Discord/Telegram 等） | 仅 Web/App |
 | **工具能力** | 动态加载 Skills，可执行任意命令 | 有限的工具调用 |
 | **记忆** | 长期记忆 + 每日笔记 + 向量检索 | 会话级记忆 |
 | **定制性** | 高度可定制，插件化架构 | 封闭系统 |
 
-**简单说：**
+简单说：
 - Claude/ChatGPT 是"汽车"（成品，直接开）
 - OpenClaw 是"汽车工厂"（可以造各种车，定制化）
 
 ---
 
 ### Q2: 什么是 Skills？它和 Plugins 有什么区别？
-
-**Answer:**
-
-**Skills（技能包）：**
-- **用途**：为 Agent 提供特定领域的知识和工作流程
-- **内容**：Markdown 文档 + 可选脚本/资源
-- **加载方式**：渐进式披露（Metadata → Body → Resources）
-- **数量**：54+ 社区贡献的 Skills
-- **示例**：`ssh-remote-exec`、`docker-management`、`weather` 等
-
-**Plugins（插件）：**
-- **用途**：扩展 OpenClaw 核心功能
-- **内容**：TypeScript/Go 代码模块
-- **加载方式**：动态加载到 Gateway
-- **数量**：33+ 核心扩展
-- **示例**：通道插件（WhatsApp、Telegram）、工具插件（exec、read）
-
-**对比表：**
 
 | 维度 | Skills | Plugins |
 |------|--------|---------|
@@ -69,121 +48,68 @@ OpenClaw 是一个 **AI Agent 运行时框架**，而不仅仅是聊天机器人
 | **触发** | 用户 query 匹配 | Gateway 自动加载 |
 | **修改** | 用户可直接编辑 | 需要开发能力 |
 | **分发** | ClawHub 分享 | 源码集成 |
+| **安全** | 无特殊校验 | `isUnsafePluginCandidate()` 校验路径/权限/归属 |
+
+> 源码: `src/plugins/discovery.ts` — 插件发现与安全检查
 
 ---
 
 ### Q3: 主会话和独立会话有什么区别？
 
-**Answer:**
-
 OpenClaw 支持两种 Agent 运行模式：
 
-### 主会话 (Main Session)
+| 特性 | 主会话 (Main Session) | 独立会话 (Isolated Session) |
+|------|----------------------|---------------------------|
+| 生命周期 | 与用户会话绑定，长期存在 | 临时创建，任务完成后可删除 |
+| 上下文 | 完整（历史 + 长期记忆） | 仅限当前任务 |
+| MEMORY.md | ✅ 加载 | ❌ 不加载 |
+| 沙箱 | 无隔离 | Docker 沙箱 |
+| Session ID 校验 | `SAFE_SESSION_ID_RE = /^[a-z0-9][a-z0-9._-]{0,127}$/i` | 同左 |
 
-**特点：**
-- 与用户直接交互的唯一会话
-- 长期存在，生命周期与用户会话绑定
-- 访问完整上下文（历史消息 + 长期记忆）
-- 可以调用所有可用工具
-- **会加载 MEMORY.md**（用户长期偏好/知识）
-
-**使用场景：**
-- 日常对话
-- 复杂任务处理
-- 需要长期记忆的任务
-
-### 独立会话 (Isolated Session)
-
-**特点：**
-- 临时创建的子会话
-- 任务完成后可自动删除
-- **不会加载 MEMORY.md**（仅限当前任务上下文）
-- 独立的沙箱环境（Docker）
-- 有独立的执行超时限制
-
-**使用场景：**
-- Cron 定时任务
-- 危险的工具调用（需要沙箱）
-- 独立的分析任务
-- 不需要长期记忆的一次性任务
-
-**图示：**
+> 源码: `src/config/sessions/paths.ts:60` — Session ID 正则校验
 
 ```mermaid
 graph TB
     subgraph "主会话"
-        MS1[用户直接对话]
-        MS2[完整上下文]
-        MS3[加载 MEMORY.md]
-        MS4[无超时限制]
+        MS1[用户直接对话] --> MS2[完整上下文]
+        MS2 --> MS3[加载 MEMORY.md]
+        MS3 --> MS4[无超时限制]
     end
-    
     subgraph "独立会话"
-        IS1[自动创建/销毁]
-        IS2[有限上下文]
-        IS3[不加载 MEMORY.md]
-        IS4[Docker 沙箱 + 超时]
+        IS1[自动创建/销毁] --> IS2[有限上下文]
+        IS2 --> IS3[不加载 MEMORY.md]
+        IS3 --> IS4[Docker 沙箱 + 超时]
     end
-    
-    MS1 --> MS2
-    MS2 --> MS3
-    MS3 --> MS4
-    
-    IS1 --> IS2
-    IS2 --> IS3
-    IS3 --> IS4
 ```
 
 ---
 
-## 架构设计
+## 2. 架构与启动
 
 ### Q4: Gateway 是什么？为什么说它是中心化设计？
 
-**Answer:**
-
-**Gateway 是 OpenClaw 的中枢系统**，负责：
-1. 消息路由（所有通道的消息都经过它）
-2. 连接管理（WebSocket 长连接）
-3. 认证授权
-4. 通道协调
-5. Agent 会话管理
-
-### 架构位置
+**Gateway 是 OpenClaw 的中枢系统**，负责消息路由、连接管理（WebSocket）、认证授权、通道协调以及 Agent 会话管理。
 
 ```
 用户 ──► 消息通道(Telegram/QQ等) ──► Gateway(ws://127.0.0.1:18789) ──► Agent 运行时
-                                                           │
-                                                           ▼
-                                                      工具执行引擎
+                                                       │
+                                                       ▼
+                                                  工具执行引擎
 ```
 
-### 为什么说中心化？
+**中心化的优缺点：**
 
-**优点：**
-- ✅ 单一真相来源
-- ✅ 易于管理连接状态
-- ✅ 统一的认证和授权
-- ✅ 简化消息路由逻辑
+| 优点 | 缺点 |
+|------|------|
+| 单一真相来源 | 单点故障风险 |
+| 易于管理连接状态 | 扩展性受限 |
+| 统一的认证和授权 | 所有通道共享同一 Gateway |
 
-**缺点：**
-- ⚠️ 单点故障风险
-- ⚠️ 扩展性受限（单节点性能瓶颈）
-- ⚠️ 所有通道共享同一 Gateway
-
-### 替代方案（未来可能的方向）
-
-- 分布式 Gateway 集群
-- 通道级联模式（Gateway 之间的路由）
-- 边缘计算（轻量级节点 + 中心 Gateway）
+**替代方案（未来可能的方向）：** 分布式 Gateway 集群、通道级联模式、边缘计算（轻量级节点 + 中心 Gateway）。
 
 ---
 
 ### Q5: 消息是如何从 QQ/Telegram 到达 Agent 的？
-
-**Answer:**
-
-完整消息流：
 
 ```mermaid
 sequenceDiagram
@@ -195,10 +121,10 @@ sequenceDiagram
     participant M as 模型
 
     U->>C: 发送消息
-    C->>G: WebSocket 发送消息<br/>格式：MessageEvent
-    G->>G: 消息路由<br/>确定目标会话
+    C->>G: WebSocket 发送 MessageEvent
+    G->>G: 消息路由 — 确定目标会话
     G->>A: 路由消息到 Agent
-    A->>M: 模型调用<br/>System Prompt + 历史 + Skills
+    A->>M: 模型调用（System Prompt + 历史 + Skills）
     M-->>A: 流式响应
     A->>T: 工具调用（需要时）
     T-->>A: 工具执行结果
@@ -211,20 +137,18 @@ sequenceDiagram
 
 **关键步骤：**
 
-1. **通道适配器**：将各平台消息格式转换为内部统一格式
-2. **消息路由器**：根据会话 ID 路由到正确的 Agent
-3. **上下文构建器**：组装 System Prompt + 历史消息 + 适用 Skills
-4. **模型调用器**：发送请求到 AI 模型
-5. **工具执行器**：解析模型输出的工具调用，执行并返回结果
-6. **流式输出**：将响应流式返回给用户
+1. **通道适配器** — 将各平台消息格式转换为内部统一格式
+2. **消息路由器** — 根据会话 ID 路由到正确的 Agent
+3. **上下文构建器** — 组装 System Prompt + 历史消息 + 适用 Skills
+4. **模型调用器** — 发送请求到 AI 模型
+5. **工具执行器** — 解析模型输出的工具调用，执行并返回结果
+6. **流式输出** — 将响应流式返回给用户
 
 ---
 
-## Agent 运行时
+## 3. Agent 运行时
 
 ### Q6: Agent 上下文中包含哪些内容？
-
-**Answer:**
 
 Agent 上下文是一个分层结构：
 
@@ -233,34 +157,21 @@ Agent 上下文是一个分层结构：
 │           Agent 完整上下文                    │
 ├─────────────────────────────────────────────┤
 │  1. System Prompt（系统提示词）              │
-│     - SOUL.md 内容                          │
-│     - AGENTS.md 指令                        │
-│     - 动态生成的指令                         │
+│     - SOUL.md / AGENTS.md / 动态指令        │
 ├─────────────────────────────────────────────┤
 │  2. 用户历史消息                             │
-│     - 当前会话消息                           │
-│     - 重要历史消息（摘要后）                 │
+│     - 当前会话 + 摘要后的历史                │
 ├─────────────────────────────────────────────┤
 │  3. 适用 Skills（渐进式披露）                │
-│     - Skill Metadata（总是加载）             │
-│     - SKILL.md Body（条件加载）             │
-│     - Bundled Resources（按需加载）          │
+│     - Metadata → Body → Resources           │
 ├─────────────────────────────────────────────┤
-│  4. 工具定义列表                             │
-│     - 工具名称和描述                         │
-│     - 参数模式                               │
+│  4. 工具定义 + 工具执行历史                  │
 ├─────────────────────────────────────────────┤
-│  5. 工具执行历史                             │
-│     - 已调用的工具列表                       │
-│     - 工具执行结果                           │
+│  5. 长期记忆（仅主会话）                     │
+│     - MEMORY.md                             │
 ├─────────────────────────────────────────────┤
-│  6. 长期记忆（仅主会话）                     │
-│     - MEMORY.md 内容                        │
-├─────────────────────────────────────────────┤
-│  7. 项目上下文（workspace files）            │
-│     - SOUL.md, USER.md                     │
-│     - HEARTBEAT.md                         │
-│     - 其他用户配置文件                       │
+│  6. 项目上下文                               │
+│     - SOUL.md, USER.md, HEARTBEAT.md        │
 └─────────────────────────────────────────────┘
 ```
 
@@ -268,50 +179,22 @@ Agent 上下文是一个分层结构：
 
 ### Q7: 上下文窗口是如何管理的？如何防止溢出？
 
-**Answer:**
+OpenClaw 使用**动态上下文压缩**机制。压缩触发条件包括：Token 数量接近模型限制（约 80% 阈值）、连续多次模型调用、长时间会话。
 
-OpenClaw 使用 **动态上下文压缩** 机制：
+**保留优先级（从高到低）：**
 
-### 压缩触发条件
-
-- Token 数量接近模型限制（通常是 80% 阈值）
-- 连续多次模型调用
-- 长时间会话
-
-### 压缩策略
-
-```mermaid
-graph LR
-    A[原始消息历史] --> B{Token 计数}
-    B -->|超过阈值| C[摘要压缩]
-    B -->|严重溢出| D[选择性删除]
-    C --> E[保留关键信息]
-    D --> F[仅保留最近 N 条]
-    E --> G[压缩后上下文]
-    F --> G
-```
-
-**保留优先级：**
 1. System Prompt（永不删除）
 2. 工具定义（必需）
 3. Skills（按需加载）
 4. 工具执行历史（保留摘要）
-5. 用户消息（保留最近 20-50 条）
+5. 用户消息（保留最近 20–50 条）
 6. AI 响应（可大幅压缩）
 
-### 手动触发压缩
-
-用户可以要求 Agent 压缩上下文：
-- "压缩一下上下文"
-- "清理一下历史"
+> 具体的 Context Overflow 恢复策略见 [Q9](#q9-context-overflow-恢复策略的详细步骤)。
 
 ---
 
 ### Q8: 工具调用的完整流程是什么？
-
-**Answer:**
-
-工具调用是 OpenClaw 的核心能力：
 
 ```mermaid
 sequenceDiagram
@@ -321,51 +204,149 @@ sequenceDiagram
     participant E as 执行引擎
     participant R as 结果格式化
 
-    M->>P: 输出工具调用<br/>{"tool": "read", "parameters": {...}}
-    P->>V: 验证工具可用性
-    V->>V: 检查白名单
-    V->>V: 检查参数合法性
-    V-->>P: 验证通过/失败
-    P->>E: 执行工具
-    E->>E: 沙箱隔离（Docker）
-    E->>E: 环境变量过滤
-    E->>E: 执行命令
+    M->>P: 输出工具调用 {"tool": "read", "parameters": {...}}
+    P->>V: 验证工具可用性 + 参数合法性
+    V-->>P: 通过/失败
+    P->>E: 执行工具（沙箱隔离 + 环境变量过滤）
     E-->>P: 原始结果
-    P->>R: 格式化结果
-    R-->>M: 结构化结果<br/>模型继续处理
+    P->>R: 格式化 + Tool Result Context Guard 截断
+    R-->>M: 结构化结果，模型继续处理
 ```
 
-### 工具调用格式
+**Tool Result Context Guard（预防性截断）：**
 
-```typescript
-interface ToolCall {
-  tool: string;           // 工具名称
-  parameters: Record<string, any>; // 参数对象
-  id?: string;            // 调用 ID（用于引用）
-}
+| 常量 | 值 | 说明 |
+|------|-----|------|
+| `MAX_TOOL_RESULT_CONTEXT_SHARE` | `0.3` | 单个工具结果占上下文窗口最大比例 |
+| `HARD_MAX_TOOL_RESULT_CHARS` | `400,000` | 单个工具结果硬字符上限（约 100K tokens） |
 
-interface ToolResult {
-  success: boolean;
-  output?: string;       // 输出内容
-  error?: string;        // 错误信息
-  metadata?: {
-    executionTime: number;
-    exitCode: number;
-  };
-}
-```
+> 源码: `src/agents/pi-embedded-runner/tool-result-truncation.ts:11-19`、`src/agents/session-tool-result-guard.ts:26-33`
 
 ---
 
-## Skills 系统
+### Q9: Context Overflow 恢复策略的详细步骤？
 
-### Q9: Skills 是如何被触发的？什么条件会加载某个 Skill？
+当模型返回上下文溢出错误时，运行时会执行一个多阶段恢复流程：
 
-**Answer:**
+```mermaid
+flowchart TD
+    A[模型返回错误] --> B{isLikelyContextOverflowError?}
+    B -->|否| Z[其他错误处理]
+    B -->|是| C{overflowCompactionAttempts < 3?}
+    C -->|是| D[contextEngine.compact]
+    D --> E{compacted?}
+    E -->|是| F[重试模型调用]
+    E -->|否| G{有 oversized tool results?}
+    C -->|否| G
+    G -->|是| H[truncateOversizedToolResultsInSession]
+    H --> I{truncated?}
+    I -->|是| F
+    I -->|否| J[放弃并返回错误]
+    G -->|否| J
+    J --> K["Context overflow: prompt too large for the model.<br/>Try /reset or /new, or use a larger-context model."]
+```
 
-Skills 使用 **渐进式披露** 机制：
+**阶段 1 — 检测（`isLikelyContextOverflowError()`）**
 
-### 三层加载流程
+函数通过正则匹配错误消息来判断是否为上下文溢出。它会排除以下误报：
+- Groq 的 413 TPM 限流（`hasRateLimitTpmHint`）
+- Reasoning 约束错误
+- 计费/配额错误（`isBillingErrorMessage`）
+- 上下文窗口过小错误（`CONTEXT_WINDOW_TOO_SMALL_RE`）
+
+> 源码: `src/agents/pi-embedded-helpers/errors.ts:127-164`
+
+**阶段 2 — 压缩（最多 3 次尝试）**
+
+```
+MAX_OVERFLOW_COMPACTION_ATTEMPTS = 3
+```
+
+每次尝试调用 `contextEngine.compact()`，传入 `trigger: "overflow"` 和当前尝试次数。压缩引擎会按优先级删减旧消息、工具结果、AI 响应等。
+
+> 源码: `src/agents/pi-embedded-runner/run.ts:740`（常量）、`run.ts:1055-1092`（compact 调用）
+
+**阶段 3 — 兜底：截断超大工具结果**
+
+如果 3 次压缩都无法解决，则调用 `truncateOversizedToolResultsInSession()`，对会话中超大的工具结果进行截断。
+
+> 源码: `src/agents/pi-embedded-runner/tool-result-truncation.ts:206-211`
+
+**阶段 4 — 放弃**
+
+所有恢复手段耗尽后，返回用户可读的错误提示，建议 `/reset` 或切换到更大上下文窗口的模型。
+
+---
+
+### Q10: Auth Profile 轮转和 Failover 是怎么工作的？
+
+Auth Profile 系统允许配置多个 API 密钥，在限流、故障时自动轮转和降级。
+
+```mermaid
+flowchart TD
+    A[resolveAuthProfileOrder] --> B[按优先级排列 profile 列表]
+    B --> C[尝试当前 profile 调用模型]
+    C --> D{成功?}
+    D -->|是| E[markAuthProfileGood]
+    D -->|否| F[markAuthProfileFailure]
+    F --> G{advanceAuthProfile 有下一个?}
+    G -->|是| C
+    G -->|否| H{所有 profile 都在 cooldown?}
+    H -->|是| I[Transient Cooldown Probe]
+    I --> J{probe 成功?}
+    J -->|是| E
+    J -->|否| K[抛出 FailoverError]
+    K --> L[model-fallback 层接管]
+    H -->|否| K
+```
+
+**核心函数链路：**
+
+| 函数 | 源码位置 | 职责 |
+|------|----------|------|
+| `resolveAuthProfileOrder()` | `src/agents/auth-profiles/order.ts:67` | 解析 profile 优先级顺序，清除过期 cooldown |
+| `advanceAuthProfile()` | `src/agents/pi-embedded-runner/run.ts:634` | 跳过 cooldown 中的 profile，尝试下一个 |
+| `markAuthProfileFailure()` | `src/agents/auth-profiles/usage.ts:464` | 记录失败，达到阈值后进入 cooldown |
+| `markAuthProfileGood()` | `src/agents/auth-profiles/profiles.ts:87` | 记录成功，更新 `lastGood` |
+
+**运行时常量：**
+
+| 常量 | 值 | 说明 |
+|------|-----|------|
+| `BASE_RUN_RETRY_ITERATIONS` | `24` | 基础重试次数 |
+| `RUN_RETRY_ITERATIONS_PER_PROFILE` | `8` | 每增加一个 profile 额外重试次数 |
+| `MIN_RUN_RETRY_ITERATIONS` | `32` | 最小重试次数 |
+| `MAX_RUN_RETRY_ITERATIONS` | `160` | 最大重试次数 |
+
+> 源码: `src/agents/pi-embedded-runner/run.ts:136-146`
+
+最大重试次数计算公式：
+
+```typescript
+const scaled = BASE_RUN_RETRY_ITERATIONS
+  + Math.max(1, profileCandidateCount) * RUN_RETRY_ITERATIONS_PER_PROFILE;
+return Math.min(MAX_RUN_RETRY_ITERATIONS, Math.max(MIN_RUN_RETRY_ITERATIONS, scaled));
+```
+
+**Transient Cooldown Probe：**
+
+当所有 profile 都处于 cooldown 但原因是 **暂时性的**（`rate_limit` / `overloaded` / `billing` / `unknown`）时，运行时会执行一次"探测"请求——跳过 cooldown 检查，尝试调用一次模型。每个 provider 每次 fallback 运行最多探测一次。
+
+> 源码: `src/agents/pi-embedded-runner/run.ts:665-696`（probe 逻辑）、`src/agents/model-fallback.ts:588-633`（fallback 层）
+
+**FailoverError：**
+
+当所有 profile 和探测都失败后，抛出 `FailoverError`，携带 `reason`、`provider`、`model`、`profileId`、`status` 等信息，交由 `model-fallback.ts` 选择备选模型继续运行。
+
+> 源码: `src/agents/failover-error.ts:11-39`
+
+---
+
+## 4. Skills 系统
+
+### Q11: Skills 是如何被触发的？什么条件会加载某个 Skill？
+
+Skills 使用**渐进式披露**机制，分三层加载：
 
 ```mermaid
 graph TB
@@ -378,76 +359,17 @@ graph TB
     F --> H[按需加载 Resources]
     G --> H
     H --> I[集成到上下文]
-    I --> J[Agent 执行]
 ```
 
-### 触发条件
-
-**1. Metadata 层（总是加载）**
-- Frontmatter 中的 `name` 和 `description`
-- 简短关键词匹配
-
-**2. Body 层（条件加载）**
-- 用户 query 包含 Skill 描述中的关键词
-- 明确表达需要该 Skill 的功能
-- 模糊匹配 + 语义相似度
-
-**3. Resources 层（按需加载）**
-- 执行到需要脚本的步骤
-- 引用到 reference 文档
-- 使用到 asset 资源
-
-### 示例
-
-```
-用户: "帮我远程重启 nginx"
-
-匹配分析:
-├── ssh-remote-exec (高匹配) ✓
-│   ├── Metadata: "SSH remote execution" ✓
-│   └── Body: "Docker management" ✓
-│
-└── docker-management (低匹配) ✗
-    └── 不相关
-```
+| 层级 | 加载条件 | 内容 |
+|------|----------|------|
+| **Metadata 层**（总是加载） | Frontmatter 中的 `name` + `description` | 简短关键词匹配 |
+| **Body 层**（条件加载） | 用户 query 包含关键词 / 语义相似 | SKILL.md 正文 |
+| **Resources 层**（按需加载） | 执行到需要脚本的步骤 | 脚本、reference 文档、asset 资源 |
 
 ---
 
-### Q10: Skill 的 frontmatter 包含哪些字段？
-
-**Answer:**
-
-每个 Skill 的 `SKILL.md` 以 YAML frontmatter 开头：
-
-```yaml
----
-name: skill-name-here
-description: |
-  详细的技能描述
-  可以多行
-  说明用途和触发条件
-metadata:
-  {
-    "openclaw": {
-      "requires": { "bins": ["command"] },
-      "install": [...]
-    },
-    "example": "usage example"
-  }
----
-```
-
-### 字段说明
-
-| 字段 | 必填 | 说明 |
-|------|------|------|
-| `name` | ✅ | Skill 名称（小写、中划线） |
-| `description` | ✅ | 详细描述，用于匹配 |
-| `metadata` | ❌ | 附加元数据 |
-| `metadata.openclaw.requires.bins` | ❌ | 依赖的系统命令 |
-| `metadata.openclaw.install` | ❌ | 安装指令 |
-
-### 示例
+### Q12: Skill 的 frontmatter 包含哪些字段？
 
 ```yaml
 ---
@@ -458,37 +380,47 @@ description: |
   - Current temperature
   - Weather forecast
   - Rain/snow prediction
-  - Weather alerts
+metadata:
+  {
+    "openclaw": {
+      "requires": { "bins": ["curl"] },
+      "install": [...]
+    }
+  }
 ---
 ```
 
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `name` | ✅ | Skill 名称（小写、中划线） |
+| `description` | ✅ | 详细描述，用于匹配和触发 |
+| `metadata` | ❌ | 附加元数据 |
+| `metadata.openclaw.requires.bins` | ❌ | 依赖的系统命令 |
+| `metadata.openclaw.install` | ❌ | 安装指令 |
+
 ---
 
-## 消息系统
+## 5. 消息系统
 
-### Q11: 消息类型有哪些？有什么区别？
-
-**Answer:**
-
-OpenClaw 定义了多种消息类型：
+### Q13: 消息类型有哪些？有什么区别？
 
 ```typescript
 enum MessageType {
-  TEXT = "text",           // 普通文本
-  IMAGE = "image",         // 图片
-  VIDEO = "video",         // 视频
-  AUDIO = "audio",         // 音频
-  FILE = "file",           // 文件
-  SYSTEM = "system",       // 系统消息
-  TOOL_CALL = "tool_call", // 工具调用
-  TOOL_RESULT = "tool_result", // 工具结果
-  REACTION = "reaction",   // 表情反应
-  EDIT = "edit",           // 消息编辑
-  DELETE = "delete",       // 消息删除
+  TEXT = "text",
+  IMAGE = "image",
+  VIDEO = "video",
+  AUDIO = "audio",
+  FILE = "file",
+  SYSTEM = "system",
+  TOOL_CALL = "tool_call",
+  TOOL_RESULT = "tool_result",
+  REACTION = "reaction",
+  EDIT = "edit",
+  DELETE = "delete",
 }
 ```
 
-### 消息状态
+**消息状态机：**
 
 ```mermaid
 stateDiagram-v2
@@ -505,11 +437,7 @@ stateDiagram-v2
 
 ---
 
-### Q12: 消息路由是如何工作的？
-
-**Answer:**
-
-消息路由决定消息从哪里来、到哪里去：
+### Q14: 消息路由是如何工作的？
 
 ```mermaid
 flowchart TD
@@ -518,63 +446,39 @@ flowchart TD
     C -->|用户消息| D[查找会话]
     C -->|系统消息| E[处理事件]
     C -->|工具调用| F[执行工具]
-    
     D --> G{会话存在?}
     G -->|是| H[追加到历史]
-    G -->|否| I[创建新会话]
-    I --> J[初始化 Agent]
-    J --> H
-    
-    H --> K[路由到 Agent]
-    K --> L[模型处理]
-    L --> M[生成响应]
-    M --> N[返回给用户]
+    G -->|否| I[创建新会话 → 初始化 Agent]
+    I --> H
+    H --> K[路由到 Agent → 模型处理 → 生成响应]
 ```
 
-### 路由规则优先级
+**路由规则优先级：**
 
-1. **精确匹配**：会话 ID 完全匹配
-2. **通道 + 发送者**：同一通道的同一用户
-3. **主题匹配**：基于话题的会话关联
-4. **新建会话**：无匹配时创建
+1. 精确匹配 — 会话 ID 完全匹配
+2. 通道 + 发送者 — 同一通道的同一用户
+3. 主题匹配 — 基于话题的会话关联
+4. 新建会话 — 无匹配时创建
 
 ---
 
-## 通道系统
+## 6. 通道系统
 
-### Q13: 通道适配器是如何工作的？
+### Q15: 通道适配器是如何工作的？
 
-**Answer:**
-
-每个消息通道都有一个适配器，负责：
-
-```mermaid
-graph LR
-    subgraph "通道适配器职责"
-        A[接收消息] --> B[格式转换]
-        B --> C[发送响应]
-        C --> D[事件处理]
-        D --> E[状态同步]
-    end
-    
-    subgraph "内部格式 ↔ 通道格式"
-        F[内部 Message] <--> G[通道特定格式]
-    end
-```
-
-### 示例：Telegram 适配器
+每个消息通道都有一个适配器，负责格式转换：
 
 ```
-Telegram Bot API         OpenClaw 内部格式
-┌──────────────────┐    ┌──────────────────┐
-│ Update Object    │ ─► │ Message Event   │
-│ - message.text   │    │ - content.text  │
-│ - message.from   │    │ - author.id     │
-│ - chat.id        │    │ - channel.id    │
-└──────────────────┘    └──────────────────┘
+Telegram Bot API              OpenClaw 内部格式
+┌──────────────────┐         ┌──────────────────┐
+│ Update Object    │   ──►   │ Message Event    │
+│ - message.text   │         │ - content.text   │
+│ - message.from   │         │ - author.id      │
+│ - chat.id        │         │ - channel.id     │
+└──────────────────┘         └──────────────────┘
 ```
 
-### 支持的通道
+**支持的通道：**
 
 | 通道 | 类型 | 协议 | 特点 |
 |------|------|------|------|
@@ -589,13 +493,11 @@ Telegram Bot API         OpenClaw 内部格式
 
 ---
 
-### Q14: 可以在同一台服务器上运行多个通道吗？
+### Q16: 可以在同一台服务器上运行多个通道吗？
 
-**Answer:**
+**可以**。有两种方案：
 
-**可以**，但有一些注意事项：
-
-### 方案 1：单 Gateway 多通道（推荐）
+**方案 1：单 Gateway 多通道（推荐）**
 
 ```
 Gateway (ws://127.0.0.1:18789)
@@ -604,16 +506,9 @@ Gateway (ws://127.0.0.1:18789)
     └── Discord 适配器
 ```
 
-**优点：**
-- ✅ 资源共享
-- ✅ 统一管理
-- ✅ 简单部署
+优点：资源共享、统一管理、简单部署。缺点：共享连接限额、故障影响范围大。
 
-**缺点：**
-- ⚠️ 共享连接限额
-- ⚠️ 故障影响范围大
-
-### 方案 2：多 Gateway 分布式
+**方案 2：多 Gateway 分布式**
 
 ```
 Gateway-1 (Telegram) ─┐
@@ -621,32 +516,17 @@ Gateway-2 (QQ)      ──┼── 共享配置/数据库
 Gateway-3 (Discord) ─┘
 ```
 
-**优点：**
-- ✅ 故障隔离
-- ✅ 独立扩展
-- ✅ 独立配置
+优点：故障隔离、独立扩展。缺点：配置复杂、需要共享存储。
 
-**缺点：**
-- ⚠️ 配置复杂
-- ⚠️ 需要共享存储
-
-### 注意事项
-
-- **Webhooks**：某些通道需要公网可访问
-- **Rate Limits**：各平台有限制，需要合理分配
-- **Token 管理**：每个通道需要独立的 API Token
+**注意事项：** Webhooks 需要公网可访问；各平台有 Rate Limits；每个通道需要独立的 API Token。
 
 ---
 
-## 记忆系统
+## 7. 记忆系统
 
-### Q15: MEMORY.md 和 daily notes 有什么区别？
-
-**Answer:**
+### Q17: MEMORY.md 和 daily notes 有什么区别？
 
 OpenClaw 有三层记忆系统：
-
-### 记忆对比表
 
 | 特性 | MEMORY.md | daily notes | 会话历史 |
 |------|-----------|-------------|----------|
@@ -657,131 +537,45 @@ OpenClaw 有三层记忆系统：
 | **检索** | 语义搜索 | 关键词搜索 | 全文搜索 |
 | **清理策略** | 手动维护 | 自动归档 | 自动压缩 |
 
-### 记忆加载优先级
-
 ```mermaid
 graph TD
-    A[用户会话开始] --> B[加载 MEMORY.md<br/>(主会话)]
-    B --> C[加载 daily notes<br/>(相关日期)]
-    C --> D[加载会话历史<br/>(摘要)]
+    A[用户会话开始] --> B["加载 MEMORY.md（主会话）"]
+    B --> C["加载 daily notes（相关日期）"]
+    C --> D["加载会话历史（摘要）"]
     D --> E[构建完整上下文]
 ```
 
-### 使用建议
-
-**MEMORY.md 存储：**
-- 用户偏好（"喜欢用 Vim"）
-- 重要决策（"使用 PostgreSQL"）
-- 长期知识（"项目架构是微服务"）
-- 敏感信息（GitHub Token）
-
-**daily notes 存储：**
-- 今日待办
-- 会议记录
-- 临时发现
-- 实验结果
-
-**会话历史：**
-- 原始对话
-- 工具调用记录
-- 错误日志
-
 ---
 
-### Q16: 语义搜索是如何工作的？
+### Q18: 语义搜索是如何工作的？
 
-**Answer:**
+OpenClaw 使用 **sqlite-vec**（SQLite 扩展）进行语义搜索。
 
-OpenClaw 使用 **sqlite-vec** 进行语义搜索：
-
-### 技术栈
-
-- **向量数据库**：sqlite-vec（SQLite 扩展）
-- **嵌入模型**：sentence-transformers
-- **相似度计算**：余弦相似度
-
-### 工作流程
+**技术栈：** 嵌入模型 sentence-transformers (all-MiniLM-L6-v2)，生成 384 维向量，余弦相似度匹配。
 
 ```mermaid
 sequenceDiagram
     participant U as 用户
     participant S as 搜索模块
-    participant V as 向量索引
+    participant V as 向量索引 (sqlite-vec)
     participant D as 文档存储
 
     U->>S: 查询文本
-    S->>S: 生成嵌入向量
-    S->>V: 搜索相似向量
-    V-->>S: 返回 Top-K 结果
-    S->>D: 获取对应文档
-    D-->>S: 返回文档片段
+    S->>S: Sentence Transformer → 384 维向量
+    S->>V: 搜索相似向量 (Top-K)
+    V-->>S: 返回匹配结果
+    S->>D: 获取对应文档片段
+    D-->>S: 返回文档
     S-->>U: 语义检索结果
-```
-
-### 向量化流程
-
-```
-用户输入
-    │
-    ▼
-┌─────────────────┐
-│ Sentence Transformer │
-│   (all-MiniLM-L6-v2) │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│  384 维向量     │
-│  [0.123, ...]   │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│   存入 SQLite   │
-│   vec0 表       │
-└─────────────────┘
-```
-
-### 使用示例
-
-```typescript
-// 语义搜索记忆
-const results = await semanticSearch(
-  query: "用户在GitHub的设置",
-  memoryDir: "./workspace",
-  maxResults: 5
-);
 ```
 
 ---
 
-## 工具系统
+## 8. 工具系统
 
-### Q17: 工具白名单和黑名单是如何工作的？
+### Q19: 工具白名单和黑名单是如何工作的？
 
-**Answer:**
-
-工具系统使用 **策略引擎** 控制工具访问：
-
-### 策略配置
-
-```typescript
-interface ToolPolicy {
-  // 白名单模式
-  allowPatterns: string[];
-  
-  // 黑名单模式
-  denyPatterns: string[];
-  
-  // 危险命令阻止
-  dangerousCommands: string[];
-  
-  // 审批要求
-  requireApproval: string[];
-}
-```
-
-### 执行流程
+工具系统使用策略引擎控制工具访问：
 
 ```mermaid
 flowchart TD
@@ -789,9 +583,10 @@ flowchart TD
     B --> C{匹配白名单?}
     C -->|否| D[拒绝执行]
     C -->|是| E{匹配黑名单?}
-    E -->|是| F[检查审批状态]
-    F -->|未审批| G[请求用户审批]
-    G -->|批准| H[继续执行]
+    E -->|是| F{已审批?}
+    F -->|否| G[请求用户审批]
+    F -->|是| H[继续执行]
+    G -->|批准| H
     G -->|拒绝| D
     E -->|否| I{危险命令?}
     I -->|是| J[额外验证]
@@ -801,90 +596,13 @@ flowchart TD
     H --> K[执行工具]
 ```
 
-### 示例配置
-
-```yaml
-toolPolicy:
-  # 允许的工具（默认全部允许）
-  allow:
-    - "read"
-    - "write"
-    - "exec"
-    - "browser.*"
-  
-  # 禁止的工具
-  deny:
-    - "delete.*"  # 禁止删除操作
-    - "format"     # 禁止格式化
-  
-  # 需要审批的工具
-  requireApproval:
-    - "exec"  # 执行命令需要审批
-    - "browser.*"  # 浏览器操作需要审批
-```
-
 ---
 
-### Q18: 沙箱隔离是如何实现的？
+### Q20: 沙箱隔离是如何实现的？
 
-**Answer:**
+OpenClaw 使用 Docker 实现沙箱隔离。环境变量黑名单默认阻止以下危险变量：
 
-OpenClaw 使用 Docker 实现沙箱隔离：
-
-### 隔离级别
-
-```mermaid
-graph TD
-    subgraph "无隔离（主会话）"
-        A[Agent] --> B[直接执行]
-        B --> C[访问主机文件系统]
-        C --> D[环境变量全部可见]
-    end
-    
-    subgraph "Docker 沙箱（独立会话）"
-        E[Agent] --> F[Docker 容器]
-        F --> G[隔离的文件系统]
-        G --> H[限制的环境变量]
-        H --> I[网络隔离（可选）]
-    end
-    
-    subgraph "Kubernetes 隔离（企业版）"
-        J[Agent] --> K[Pod]
-        K --> L[更严格的资源限制]
-    end
 ```
-
-### Docker 配置
-
-```typescript
-interface SandboxConfig {
-  // 基础配置
-  image: string;           // 镜像
-  memoryLimit: string;    // 内存限制
-  cpuLimit: number;        // CPU 限制
-  
-  // 持久化卷
-  volumes: {
-    source: string;
-    target: string;
-    readOnly: boolean;
-  }[];
-  
-  // 环境变量
-  envWhitelist: string[];  // 允许的环境变量
-  envBlacklist: string[]; // 阻止的环境变量
-  
-  // 安全选项
-  readOnlyRoot: boolean;   // 根文件系统只读
-  noNewPrivileges: boolean; // 禁止提权
-  networkMode: string;     // 网络模式（bridge/none/host）
-}
-```
-
-### 环境变量黑名单（默认阻止）
-
-```bash
-# 危险的环境变量
 LD_*           # 链接器变量（可注入代码）
 DYLD_*         # macOS 动态链接器
 NODE_OPTIONS   # Node.js 选项（可执行任意代码）
@@ -892,66 +610,35 @@ BASH_ENV       # Bash 启动脚本
 ENV            # 任意 shell 启动脚本
 ```
 
+隔离级别分为三档：无隔离（主会话直接执行）、Docker 沙箱（独立会话）、Kubernetes 隔离（企业版，更严格的资源限制）。
+
 ---
 
-## 安全与沙箱
+## 9. 安全
 
-### Q19: DM（Direct Message）陌生人配对机制是什么？
+### Q21: DM（Direct Message）陌生人配对机制是什么？
 
-**Answer:**
-
-**DM 陌生人配对** 是 OpenClaw 的安全机制，用于处理陌生人发来的私信：
-
-### 策略模式
-
-```mermaid
-stateDiagram-v2
-    [*] --> PENDING: 收到陌生人消息
-    
-    PENDING --> AUTO_REJECT: 策略=reject
-    PENDING --> AUTO_ACCEPT: 策略=accept
-    PENDING --> MANUAL_REVIEW: 策略=review
-    
-    MANUAL_REVIEW --> [*]: 拒绝<br/>（默认行为）
-    MANUAL_REVIEW --> ACTIVE: 用户批准
-    
-    ACTIVE --> RUNNING: 创建会话
-    RUNNING --> [*]: 会话结束
-```
-
-### 配对策略
+DM 陌生人配对是 OpenClaw 的安全机制，用于处理陌生人发来的私信：
 
 | 策略 | 说明 | 使用场景 |
 |------|------|----------|
 | `reject` | 自动拒绝所有陌生人 | 高安全需求 |
 | `accept` | 自动接受所有陌生人 | 低风险环境 |
-| `review` | 需要用户手动批准 | 平衡安全与便利 |
+| `review` | 需要用户手动批准 | 平衡安全与便利（默认） |
 
-### 配置示例
-
-```yaml
-dmPolicy:
-  strategy: "review"  # 默认：需要审批
-  
-  # 自动接受的白名单
-  autoAcceptFrom:
-    - "friend:*"
-    - "whitelist:*"
-  
-  # 触发审查的关键词
-  triggerKeywords:
-    - "密码"
-    - "Token"
-    - "API Key"
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: 收到陌生人消息
+    PENDING --> AUTO_REJECT: 策略=reject
+    PENDING --> AUTO_ACCEPT: 策略=accept
+    PENDING --> MANUAL_REVIEW: 策略=review
+    MANUAL_REVIEW --> [*]: 拒绝（默认）
+    MANUAL_REVIEW --> ACTIVE: 用户批准 → 创建会话
 ```
 
 ---
 
-### Q20: 如何安全地使用远程访问（Tailscale/SSH Tunnel）？
-
-**Answer:**
-
-### 架构对比
+### Q22: 如何安全地使用远程访问（Tailscale/SSH Tunnel）？
 
 ```mermaid
 graph LR
@@ -959,7 +646,6 @@ graph LR
         A[用户] --> B[Tailscale 网络]
         B --> C[OpenClaw Gateway]
     end
-    
     subgraph "方案2：SSH Tunnel"
         D[用户] --> E[SSH 加密隧道]
         E --> F[跳板机]
@@ -967,89 +653,216 @@ graph LR
     end
 ```
 
-### Tailscale 模式（推荐）
+| 特性 | Tailscale | SSH Tunnel |
+|------|-----------|------------|
+| 配置复杂度 | Zero-config | 需手动设置 |
+| 加密 | 内置 WireGuard | SSH 加密 |
+| NAT 穿透 | ✅ | ❌ 需手动 |
+| 审计 | ACL 控制 | 可审计 |
 
-**优点：**
-- ✅ Zero-config 自动组网
-- ✅ 内置 WireGuard 加密
-- ✅ ACL 访问控制
-- ✅ NAT 穿透
-
-**配置：**
-
-```yaml
-remoteAccess:
-  type: "tailscale"
-  enabled: true
-  authKey: "${TAILSCALE_AUTHKEY}"
-  advertiseRoutes:
-    - "192.168.1.0/24"
-```
-
-### SSH Tunnel 模式
-
-**优点：**
-- ✅ 成熟稳定
-- ✅ 广泛支持
-- ✅ 可审计
-
-**配置：**
-
-```bash
-# 创建隧道
-ssh -N -L 18789:localhost:18789 user@gateway-host
-
-# 或反向隧道
-ssh -N -R 18789:localhost:18789 user@gateway-host
-```
-
-### 安全最佳实践
-
-1. **使用短生命 Token**
-2. **限制访问 IP 范围**
-3. **启用审计日志**
-4. **定期轮换密钥**
-5. **使用双因素认证**
+**安全最佳实践：** 使用短生命 Token、限制访问 IP 范围、启用审计日志、定期轮换密钥、使用双因素认证。
 
 ---
 
-## 部署与配置
+### Q23: 插件安全检查机制是怎样的？
 
-### Q21: 如何选择部署方式？
+OpenClaw 在加载插件前会执行严格的安全检查，核心函数为 `isUnsafePluginCandidate()`。
 
-**Answer:**
+**检查项目：**
 
-### 部署方式对比
+| 检查 | 函数/逻辑 | 触发条件 |
+|------|-----------|----------|
+| **路径逃逸** | `checkSourceEscapesRoot()` — `isPathInside(rootRealPath, sourceRealPath)` | 插件路径超出允许的根目录 |
+| **世界可写** | `(modeBits & 0o002) !== 0` → `path_world_writable` | 文件权限允许任意用户写入 |
+| **可疑归属** | `stat.uid !== params.uid && stat.uid !== 0` → `path_suspicious_ownership` | 文件归属非当前用户且非 root |
+
+> 源码: `src/plugins/discovery.ts:250-272`（安全校验入口）、`discovery.ts:116-135`（路径逃逸）、`discovery.ts:185-208`（权限/归属）
+
+**发现缓存 TTL：**
+
+```
+DEFAULT_DISCOVERY_CACHE_MS = 1000  // ~1 秒
+DEFAULT_MANIFEST_CACHE_MS = 1000   // 清单注册表同样 ~1 秒
+```
+
+> 源码: `src/plugins/discovery.ts:38-39`、`src/plugins/manifest-registry.ts:50`
+
+**Manifest 校验：**
+
+`readPackageManifest()` 通过 `openBoundaryFileSync()` 打开 `package.json`，该函数会：
+1. 校验路径不超出插件目录边界
+2. 拒绝硬链接（`rejectHardlinks = true`）
+3. 解析 JSON 并验证结构
+
+> 源码: `src/plugins/discovery.ts:298-317`
+
+```mermaid
+flowchart TD
+    A[发现插件候选] --> B{缓存有效 < 1s?}
+    B -->|是| C[返回缓存结果]
+    B -->|否| D[isUnsafePluginCandidate]
+    D --> E{路径逃逸?}
+    E -->|是| F[拒绝 + 诊断]
+    E -->|否| G{世界可写?}
+    G -->|是| F
+    G -->|否| H{可疑归属?}
+    H -->|是| F
+    H -->|否| I[readPackageManifest]
+    I --> J{manifest 有效?}
+    J -->|否| F
+    J -->|是| K[加载插件]
+```
+
+---
+
+## 10. 配置
+
+### Q24: Config `$include` 机制是怎么工作的？
+
+OpenClaw 配置文件支持 `$include` 指令，可以将配置拆分到多个文件中。
+
+> 源码: `src/config/includes.ts`
+
+**核心常量：**
+
+| 常量 | 值 | 说明 |
+|------|-----|------|
+| `INCLUDE_KEY` | `"$include"` | 指令关键字 |
+| `MAX_INCLUDE_DEPTH` | `10` | 最大嵌套深度，防止循环引用 |
+| `MAX_INCLUDE_FILE_BYTES` | `2 * 1024 * 1024` (2 MB) | 单个 include 文件大小上限 |
+
+> 源码: `src/config/includes.ts:21-23`
+
+**使用方式：**
+
+```yaml
+# 方式 1：字符串 — include 单个文件
+$include: "./auth-config.yaml"
+
+# 方式 2：数组 — 按顺序 include 多个文件并 deep merge
+$include:
+  - "./base-config.yaml"
+  - "./auth-config.yaml"
+  - "./channel-config.yaml"
+```
+
+**Deep Merge 规则：**
+
+| 类型 | 合并行为 |
+|------|----------|
+| 数组 | 拼接（`[...target, ...source]`） |
+| 对象 | 递归合并 |
+| 原始值 | source 覆盖 target |
+
+> 源码: `src/config/includes.ts:68-84`
+
+```mermaid
+flowchart TD
+    A["解析配置文件"] --> B{包含 $include?}
+    B -->|否| C[直接使用]
+    B -->|是| D{string 还是 array?}
+    D -->|string| E[加载单个文件]
+    D -->|array| F["按序加载并 deepMerge"]
+    E --> G{"深度 >= 10?"}
+    F --> G
+    G -->|是| H[抛出 ConfigIncludeError]
+    G -->|否| I{"文件 > 2MB?"}
+    I -->|是| H
+    I -->|否| J[递归解析 $include]
+    J --> K[返回合并后的配置]
+```
+
+---
+
+### Q25: Session 磁盘空间管理？
+
+OpenClaw 提供多层 session 磁盘管理策略，防止会话文件无限膨胀。
+
+**管理函数：**
+
+| 函数 | 源码位置 | 职责 |
+|------|----------|------|
+| `pruneStaleEntries()` | `src/config/sessions/store-maintenance.ts:155` | 按 `maxAgeMs` 删除过期条目 |
+| `capEntryCount()` | `src/config/sessions/store-maintenance.ts:226` | 按 `maxEntries` 上限，按 `updatedAt` 排序保留最新 |
+| `rotateSessionFile()` | `src/config/sessions/store-maintenance.ts:275` | 文件超过 `rotateBytes` 时轮转，保留 3 个最近备份 |
+| `enforceSessionDiskBudget()` | `src/config/sessions/disk-budget.ts:188` | 全局磁盘预算，删除归档 artifacts 和无引用 transcripts |
+
+**Session ID 校验：**
+
+```
+SAFE_SESSION_ID_RE = /^[a-z0-9][a-z0-9._-]{0,127}$/i
+```
+
+> 源码: `src/config/sessions/paths.ts:60`
+
+所有 session 操作都先通过 `validateSessionId()` 检查 ID 格式，防止路径遍历攻击。不合法的 ID 会被立即拒绝。
+
+```mermaid
+flowchart TD
+    A[Session 维护触发] --> B[pruneStaleEntries]
+    B --> C["删除超时条目（maxAgeMs）"]
+    C --> D[capEntryCount]
+    D --> E["删除超限条目（按 updatedAt 排序）"]
+    E --> F{文件超过 rotateBytes?}
+    F -->|是| G["rotateSessionFile → .bak.{timestamp}"]
+    G --> H["保留 3 个最近备份"]
+    F -->|否| I[enforceSessionDiskBudget]
+    H --> I
+    I --> J["全局预算检查 → 清理归档"]
+```
+
+---
+
+### Q26: Subagent 嵌套深度如何计算？
+
+Subagent 的嵌套深度通过 `getSubagentDepth()` 函数计算，它统计 session key 中 `:subagent:` 分隔符的数量。
+
+```typescript
+// src/sessions/session-key-utils.ts:89-95
+function getSubagentDepth(sessionKey: string | undefined | null): number {
+  const raw = (sessionKey ?? "").trim().toLowerCase();
+  if (!raw) return 0;
+  return raw.split(":subagent:").length - 1;
+}
+```
+
+**示例：**
+
+| Session Key | 深度 |
+|-------------|------|
+| `user123` | 0 |
+| `user123:subagent:task1` | 1 |
+| `user123:subagent:task1:subagent:subtask` | 2 |
+
+**嵌套限制：**
+
+```
+DEFAULT_SUBAGENT_MAX_SPAWN_DEPTH = 1
+```
+
+> 源码: `src/config/agent-limits.ts:6`
+
+默认最大 spawn 深度为 **1**，即子 agent 不能再创建子 agent。可通过配置 `cfg.agents.defaults.subagents.maxSpawnDepth` 覆盖。
+
+检查位置包括：`src/agents/subagent-spawn.ts:336`、`src/agents/subagent-capabilities.ts:97,131`、`src/agents/pi-tools.policy.ts:106`。
+
+---
+
+## 11. 部署
+
+### Q27: 如何选择部署方式？
 
 | 方式 | 难度 | 扩展性 | 成本 | 适用场景 |
 |------|------|--------|------|----------|
-| **本地开发** | ⭐ | 低 | 低 | 开发测试 |
-| **Docker** | ⭐⭐ | 中 | 低 | 个人/小团队 |
-| **Systemd** | ⭐⭐ | 中 | 中 | 生产部署 |
-| **Kubernetes** | ⭐⭐⭐⭐ | 高 | 高 | 企业级 |
+| 本地开发 | ⭐ | 低 | 低 | 开发测试 |
+| Docker | ⭐⭐ | 中 | 低 | 个人/小团队 |
+| Systemd | ⭐⭐ | 中 | 中 | 生产部署 |
+| Kubernetes | ⭐⭐⭐⭐ | 高 | 高 | 企业级 |
 
-### 推荐选择
-
-**个人/开发：**
-```
-本地运行 + ngrok 暴露
-```
-
-**小团队（<100用户）：**
-```
-Docker Compose + 反向代理
-```
-
-**中大型团队：**
-```
-Kubernetes + 分布式 Gateway
-```
-
-### 配置示例（Docker Compose）
+**Docker Compose 示例：**
 
 ```yaml
 version: '3.8'
-
 services:
   gateway:
     image: openclaw/gateway:latest
@@ -1061,7 +874,6 @@ services:
     environment:
       - DATABASE_URL=sqlite:///data/openclaw.db
       - TZ=Asia/Shanghai
-
   telegram:
     image: openclaw/channel-telegram:latest
     depends_on:
@@ -1073,47 +885,27 @@ services:
 
 ---
 
-### Q22: 如何配置 AI 模型？
-
-**Answer:**
+### Q28: 如何配置 AI 模型？
 
 OpenClaw 支持多种 AI 模型提供商：
 
-### 配置示例
-
 ```yaml
 models:
-  # 默认模型
   default: "minimax"
-  
-  # MiniMax（当前使用）
   minimax:
     provider: "minimax"
     model: "MiniMax-M2.1"
     apiKey: "${MINIMAX_API_KEY}"
     baseUrl: "https://api.minimax.chat/v1"
-  
-  # Claude（可选）
   claude:
     provider: "anthropic"
     model: "claude-3-5-sonnet-20241022"
     apiKey: "${ANTHROPIC_API_KEY}"
-    maxTokens: 100000
-  
-  # GPT-4（可选）
-  gpt4:
-    provider: "openai"
-    model: "gpt-4"
-    apiKey: "${OPENAI_API_KEY}"
-  
-  # 本地 Ollama（可选）
   ollama:
     provider: "ollama"
     model: "llama3.1"
     baseUrl: "http://localhost:11434"
 ```
-
-### 模型选择策略
 
 ```mermaid
 graph TD
@@ -1125,204 +917,107 @@ graph TD
     B -->|隐私敏感| G[Ollama 本地]
 ```
 
+Auth Profile 轮转机制可为同一 provider 配置多个 API Key，实现自动 failover（详见 [Q10](#q10-auth-profile-轮转和-failover-是怎么工作的)）。
+
 ---
 
-## 常见错误排查
+## 12. 排查
 
-### Q23: Gateway 连接失败怎么办？
+### Q29: Gateway 连接失败怎么办？
 
-**Answer:**
-
-### 常见错误
+**常见错误：**
 
 ```
 Error: WebSocket connection to 'ws://127.0.0.1:18789' failed
 ```
 
-### 排查步骤
-
 ```mermaid
 flowchart TD
-    A[连接失败] --> B[Gateway 运行中?]
-    B -->|否| C[启动 Gateway]
-    C --> D[检查端口]
-    D --> E[正常?<br/>测试连接]
-    
-    B -->|是| F[端口正确?]
-    F -->|否| G[使用正确端口]
-    
-    E -->|仍失败| H[检查防火墙]
-    H --> I[开放 18789 端口]
-    
-    I --> J[检查日志]
-    J --> K[分析错误信息]
+    A[连接失败] --> B{Gateway 运行中?}
+    B -->|否| C["启动 Gateway → 检查端口"]
+    B -->|是| D{端口正确?}
+    D -->|否| E[使用正确端口]
+    D -->|是| F[检查防火墙 → 开放 18789]
+    F --> G[检查日志分析错误]
 ```
 
-### 诊断命令
+**诊断命令：**
 
 ```bash
-# 1. 检查 Gateway 状态
-openclaw gateway status
-
-# 2. 检查端口监听
-netstat -tlnp | grep 18789
-
-# 3. 测试本地连接
-curl http://127.0.0.1:18789/health
-
-# 4. 查看日志
-tail -f ~/.local/share/openclaw/logs/gateway.log
+openclaw gateway status         # 检查 Gateway 状态
+netstat -tlnp | grep 18789     # 检查端口监听
+curl http://127.0.0.1:18789/health  # 测试本地连接
+tail -f ~/.local/share/openclaw/logs/gateway.log  # 查看日志
 ```
 
 ---
 
-### Q24: 工具调用失败怎么办？
-
-**Answer:**
-
-### 错误类型
+### Q30: 工具调用失败怎么办？
 
 | 错误码 | 说明 | 解决方案 |
 |--------|------|----------|
-| `TOOL_NOT_FOUND` | 工具不存在 | 检查工具名拼写 |
+| `TOOL_NOT_FOUND` | 工具不存在 | 检查工具名拼写，运行 `openclaw tools list` |
 | `PERMISSION_DENIED` | 无权限 | 检查白名单配置 |
-| `EXECUTION_FAILED` | 执行失败 | 检查命令语法 |
+| `EXECUTION_FAILED` | 执行失败 | 手动执行命令验证语法 |
 | `TIMEOUT` | 超时 | 增加超时时间 |
-| `SANDBOX_ERROR` | 沙箱错误 | 检查 Docker 状态 |
+| `SANDBOX_ERROR` | 沙箱错误 | 检查 Docker 状态 `docker ps` |
 
-### 排查流程
+**上下文溢出相关错误：**
 
-```mermaid
-flowchart TD
-    A[工具调用失败] --> B[查看错误信息]
-    B --> C{错误类型?}
-    
-    C -->|TOOL_NOT_FOUND| D[列出可用工具]
-    D --> E[确认工具名]
-    
-    C -->|PERMISSION_DENIED| F[检查配置文件]
-    F --> G[添加白名单]
-    
-    C -->|EXECUTION_FAILED| H[手动执行命令]
-    H --> I[修复命令]
-    
-    C -->|TIMEOUT| J[增加超时时间]
-    
-    C -->|SANDBOX_ERROR| K[检查 Docker]
-    K --> L[重启 Docker]
-```
-
-### 诊断命令
-
-```bash
-# 列出可用工具
-openclaw tools list
-
-# 测试工具调用
-openclaw exec test --tool read --path /tmp/test.txt
-
-# 查看工具策略
-openclaw config get toolPolicy
-
-# 检查 Docker 状态
-docker ps
-docker logs openclaw-sandbox
-```
+如果工具结果过大导致 context overflow，运行时会自动触发 `truncateOversizedToolResultsInSession()`。预防性截断阈值为单个工具结果不超过上下文窗口的 30%（`MAX_TOOL_RESULT_CONTEXT_SHARE=0.3`）或 400K 字符（`HARD_MAX_TOOL_RESULT_CHARS`）。
 
 ---
 
-### Q25: 消息发不出去怎么办？
+### Q31: 消息发不出去怎么办？
 
-**Answer:**
-
-### 常见原因
-
-1. **通道未连接**
-2. **API Token 过期**
-3. **网络问题**
-4. **消息格式错误**
-5. **频率限制**
-
-### 排查步骤
+**常见原因与排查：**
 
 ```mermaid
 flowchart TD
-    A[消息发送失败] --> B[通道状态]
-    B --> C{通道在线?}
-    C -->|否| D[检查通道配置]
-    D --> E[重启通道]
-    
-    C -->|是| F[Token 有效?]
-    F -->|否| G[更新 Token]
-    
-    G --> H[重试发送]
-    H --> I{成功?}
-    
-    I -->|否| J[检查频率限制]
-    J --> K[降低发送频率]
+    A[消息发送失败] --> B{通道在线?}
+    B -->|否| C["检查通道配置 → 重启"]
+    B -->|是| D{Token 有效?}
+    D -->|否| E["更新 Token → 重试"]
+    D -->|是| F{频率限制?}
+    F -->|是| G[降低发送频率]
+    F -->|否| H[检查消息格式]
 ```
 
-### 诊断命令
+**Auth Profile 相关故障：**
+
+如果多个通道同时出问题，可能是 API 密钥问题。检查 auth profile 状态：
+- 所有 profile 都在 cooldown → 等待冷却或添加新 profile
+- 持续 `FailoverError` → 检查 provider 服务状态
+- Transient probe 频繁触发 → 可能是账单或配额问题
+
+**诊断命令：**
 
 ```bash
-# 查看通道状态
-openclaw channels status
-
-# 测试通道连接
-openclaw channels test telegram
-
-# 查看发送日志
-openclaw logs --channel telegram
-
-# 重新授权
-openclaw channels auth telegram --reauth
-```
-
----
-
-## 贡献指南
-
-### 如何添加新问题
-
-1. **确认问题**：先确认问题是通用的（非特定用户问题）
-2. **分类**：选择合适的章节
-3. **格式**：使用标准 Q&A 模板
-4. **代码**：包含示例代码和 Mermaid 图表
-5. **测试**：确保解答准确
-
-### Q&A 模板
-
-```markdown
-### QXX: 问题标题
-
-**Answer:**
-
-[详细解答]
-
-[可选：代码示例]
-
-[可选：Mermaid 图表]
-
-[可选：相关链接]
+openclaw channels status              # 查看通道状态
+openclaw channels test telegram       # 测试通道连接
+openclaw logs --channel telegram      # 查看发送日志
+openclaw channels auth telegram --reauth  # 重新授权
 ```
 
 ---
 
 ## 索引
 
-- [架构问题](#架构设计) - Q4-Q5
-- [Agent 问题](#agent-运行时) - Q6-Q8
-- [Skills 问题](#skills-系统) - Q9-Q10
-- [消息问题](#消息系统) - Q11-Q12
-- [通道问题](#通道系统) - Q13-Q14
-- [记忆问题](#记忆系统) - Q15-Q16
-- [工具问题](#工具系统) - Q17-Q18
-- [安全问题](#安全与沙箱) - Q19-Q20
-- [部署问题](#部署与配置) - Q21-Q22
-- [排查问题](#常见错误排查) - Q23-Q25
+| 分类 | 问题 |
+|------|------|
+| [基础概念](#1-基础概念) | Q1–Q3 |
+| [架构与启动](#2-架构与启动) | Q4–Q5 |
+| [Agent 运行时](#3-agent-运行时) | Q6–Q10（含 Auth Profile 轮转、Context Overflow 恢复） |
+| [Skills 系统](#4-skills-系统) | Q11–Q12 |
+| [消息系统](#5-消息系统) | Q13–Q14 |
+| [通道系统](#6-通道系统) | Q15–Q16 |
+| [记忆系统](#7-记忆系统) | Q17–Q18 |
+| [工具系统](#8-工具系统) | Q19–Q20 |
+| [安全](#9-安全) | Q21–Q23（含插件安全检查） |
+| [配置](#10-配置) | Q24–Q26（含 `$include`、Session 磁盘管理、Subagent 嵌套） |
+| [部署](#11-部署) | Q27–Q28 |
+| [排查](#12-排查) | Q29–Q31 |
 
 ---
 
-> 文档版本：1.0.0  
-> 最后更新：2026-02-08  
-> 维护者：OpenClaw Community
+*基于 OpenClaw v2026.2.3-1 源码分析*

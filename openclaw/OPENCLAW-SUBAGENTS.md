@@ -1,775 +1,235 @@
 # OpenClaw Subagent 机制源码深度分析
 
-> 基于源码的全面解析，帮助你深入理解 OpenClaw 的子代理（Subagent）架构
+> 基于 OpenClaw 源码的全面解析，深入理解子代理（Subagent）架构的设计哲学、核心实现与运行机制
 
 ## 目录
 
-- [概述](#概述)
-- [架构设计](#架构设计)
+- [设计理念](#设计理念)
+- [架构总览](#架构总览)
 - [核心组件](#核心组件)
-  - [Subagent Registry](#subagent-registry-注册表)
-  - [Sessions Spawn Tool](#sessions-spawn-tool-工具)
-  - [Announce System](#announce-system-通知系统)
-  - [Queue System](#queue-system-队列系统)
-- [生命周期](#生命周期)
-  - [Spawn 流程](#spawn-流程)
-  - [执行阶段](#执行阶段)
-  - [结果通知](#结果通知)
-  - [清理阶段](#清理阶段)
-- [关键机制](#关键机制)
-  - [跨代理生成](#跨代理生成)
-  - [模型选择策略](#模型选择策略)
-  - [超时控制](#超时控制)
-  - [持久化与恢复](#持久化与恢复)
-- [配置选项](#配置选项)
-- [使用示例](#使用示例)
-- [源码关键代码解读](#源码关键代码解读)
-- [常见问题](#常见问题)
+  - [Subagent Registry](#subagent-registry)
+  - [sessions_spawn Tool](#sessions_spawn-tool)
+  - [Announce System](#announce-system)
+  - [Queue Modes](#queue-modes)
+- [Subagent 嵌套深度](#subagent-嵌套深度)
+- [跨 Agent 调用](#跨-agent-调用)
+- [超时控制](#超时控制)
+- [持久化与恢复](#持久化与恢复)
+- [完整生命周期](#完整生命周期)
 
 ---
 
-## 概述
+## 设计理念
 
-OpenClaw 的 **Subagent 机制**是一个强大的后台任务执行系统，允许 Agent 在隔离的会话中启动子代理来处理复杂任务，完成后自动将结果通知到主会话。
+OpenClaw Subagent 机制围绕三个核心设计原则构建：
 
-### 核心特性
+### 1. 隔离式后台任务执行
+
+每个 Subagent 在完全独立的会话（Session）中运行，与主会话之间不共享上下文、历史记录或中间状态。这种隔离确保了：
+
+- 子任务的失败不会污染主会话状态
+- 多个 Subagent 可以并行执行互不干扰
+- 每个 Subagent 拥有独立的工具调用权限和资源配额
+
+### 2. 完成即通知（Notify-on-Complete via Announce）
+
+Subagent 不需要主会话轮询结果。当任务完成时，通过 **Announce System** 主动将结果推送回主会话。这是一种事件驱动的通知模型：
+
+```
+Subagent 完成任务 → 生成结果摘要 → Announce Queue 入队 → 按队列模式投递 → 主会话收到通知
+```
+
+### 3. 权限受控的跨 Agent 委派
+
+Subagent 可以指定不同的 Agent 来执行任务，但必须通过白名单权限校验。这使得一个"编排型" Agent 可以按需委派专业任务给不同的"专家型" Agent，同时防止未授权的跨 Agent 调用。
 
 ```mermaid
 graph TB
-    subgraph "主会话 (Main Session)"
-        A[Main Agent] -->|spawns| B[Subagent]
-        B -->|results| A
+    subgraph "设计三要素"
+        A["🔒 隔离执行<br/>独立 Session"]
+        B["📢 完成通知<br/>Announce System"]
+        C["🔑 权限管控<br/>allowAgents 白名单"]
     end
-    
-    subgraph "隔离会话 (Isolated Session)"
-        B --> C[独立执行环境]
-        C --> D[结果归档]
-    end
-    
-    subgraph "通知系统"
-        D --> E[队列处理]
-        E --> F[返回主会话]
-    end
-    
-    subgraph "持久化"
-        B --> G[Subagent Registry]
-        G --> H[磁盘存储]
-    end
-```
 
-| 特性 | 描述 |
-|------|------|
-| **隔离执行** | 每个 subagent 在独立会话中运行 |
-| **结果通知** | 完成后自动通知主会话 |
-| **持久化** | 支持崩溃恢复和重启继续 |
-| **队列管理** | 支持多种队列模式 |
-| **资源控制** | 超时、并发限制 |
-
-### 使用场景
-
-```typescript
-// Agent 可以这样调用 subagent
-await sessions_spawn({
-  task: "分析这个代码库并生成报告",
-  agentId: "research-agent",     // 可选：指定子代理
-  model: "claude-sonnet-4",       // 可选：指定模型
-  cleanup: "delete",              // 可选：完成后删除
-  label: "代码分析任务",          // 可选：任务标签
-});
+    A --> D["安全的后台任务处理"]
+    B --> D
+    C --> D
 ```
 
 ---
 
-## 架构设计
+## 架构总览
 
 ### 模块结构
 
 ```
 src/agents/
-├── subagent-registry.ts          # Subagent 注册表
-├── subagent-registry.store.ts    # 持久化存储
-├── subagent-announce.ts          # 结果通知逻辑
-├── subagent-announce-queue.ts    # 通知队列
+├── subagent-registry.ts          # Subagent 注册表（元数据与状态管理）
+├── subagent-registry.store.ts    # 持久化存储（磁盘读写）
+├── subagent-announce.ts          # 结果通知逻辑（Announce 构建）
+├── subagent-announce-queue.ts    # 通知队列（多模式排队与投递）
 ├── tools/
-│   └── sessions-spawn-tool.ts  # Spawn 工具
+│   └── sessions-spawn-tool.ts    # sessions_spawn 工具入口
 ├── lanes.ts                      # Agent 通道配置
-└── pi-embedded.ts              # 内嵌 PI 运行
+└── pi-embedded.ts                # 内嵌 PI 运行
 ```
 
 ### 核心数据流
 
 ```mermaid
 sequenceDiagram
-    participant Main as Main Agent
-    participant Spawn as SessionsSpawnTool
+    participant Main as 主 Agent
+    participant Spawn as sessions_spawn
     participant Registry as SubagentRegistry
     participant Gateway as Gateway
     participant Sub as Subagent Session
     participant Queue as Announce Queue
-    participant Main2 as Main Session
 
-    Main->>Spawn: sessions_spawn(task)
+    Main->>Spawn: sessions_spawn(task, agentId, model...)
+    Spawn->>Spawn: 权限校验 + 模型解析
     Spawn->>Registry: registerSubagentRun()
-    Registry->>Registry: persist()
-    Spawn->>Gateway: agent(sessionKey, message)
-    
-    Gateway->>Sub: 启动子代理
-    Sub->>Sub: 执行任务...
-    
-    Sub->>Registry: 更新状态
-    Sub->>Gateway: 返回结果
-    
-    Gateway->>Queue: enqueueAnnounce()
-    Queue->>Main2: 发送结果通知
+    Registry->>Registry: persist to disk
+    Spawn->>Gateway: agent(childSessionKey, systemPrompt)
+
+    Gateway->>Sub: 创建隔离会话，启动执行
+    Sub->>Sub: 独立执行任务...
+
+    Sub-->>Registry: 更新 outcome / endedAt
+    Sub-->>Queue: enqueueAnnounce(result)
+
+    Queue->>Queue: 按 mode 策略处理
+    Queue->>Main: 投递结果通知到主会话
 ```
 
 ---
 
 ## 核心组件
 
-### Subagent Registry (注册表)
+### Subagent Registry
 
 **文件**: `subagent-registry.ts`
 
-注册表是 Subagent 系统的核心，管理所有子代理运行的元数据和状态。
+Registry 是 Subagent 系统的核心状态管理器，负责维护所有子代理运行的元数据和生命周期状态。内部使用内存 `Map<string, SubagentRunRecord>` 存储，并在每次状态变更时持久化到磁盘。
+
+#### SubagentRunRecord 完整字段
 
 ```typescript
-// 核心数据结构
 export type SubagentRunRecord = {
-  runId: string;                    // 唯一运行 ID
-  childSessionKey: string;          // 子代理会话 Key
-  requesterSessionKey: string;      // 请求者会话 Key
-  requesterOrigin?: DeliveryContext; // 原始请求上下文
-  requesterDisplayKey: string;     // 请求者显示 Key
-  task: string;                    // 任务描述
-  cleanup: "delete" | "keep";      // 清理策略
-  label?: string;                  // 任务标签
-  createdAt: number;              // 创建时间
-  startedAt?: number;             // 开始时间
-  endedAt?: number;               // 结束时间
-  outcome?: SubagentRunOutcome;   // 运行结果
-  archiveAtMs?: number;           // 归档时间
-  cleanupCompletedAt?: number;    // 清理完成时间
-  cleanupHandled?: boolean;        // 是否已清理
+  // === 标识字段 ===
+  runId: string;                     // 唯一运行 ID（crypto.randomUUID() 生成）
+  childSessionKey: string;           // 子代理会话 Key（隔离会话的标识）
+  requesterSessionKey: string;       // 请求者会话 Key（发起 spawn 的主会话）
+  requesterOrigin?: DeliveryContext;  // 原始请求上下文（消息来源渠道等）
+  requesterDisplayKey: string;       // 请求者显示 Key（用于 UI 展示）
+
+  // === 任务字段 ===
+  task: string;                      // 任务描述（传递给子代理的 prompt）
+  label?: string;                    // 任务标签（可选，用于标识和检索）
+  agentId?: string;                  // 目标 Agent ID（跨 Agent 调用时指定）
+  model?: string;                    // 使用的模型标识
+
+  // === 清理策略 ===
+  cleanup: "delete" | "keep";        // "delete": 完成后删除子会话
+                                     // "keep": 保留子会话供后续查看
+
+  // === 时间戳 ===
+  createdAt: number;                 // 注册时间（registerSubagentRun 时设置）
+  startedAt?: number;                // 实际开始执行时间（Gateway 启动后设置）
+  endedAt?: number;                  // 结束时间（outcome 确定后设置）
+
+  // === 结果 ===
+  outcome?: SubagentRunOutcome;      // 运行结果（见下方类型定义）
+
+  // === 生命周期管理 ===
+  archiveAtMs?: number;              // 归档时间戳（cleanup="keep" 时设置）
+  cleanupCompletedAt?: number;       // 清理完成时间
+  cleanupHandled?: boolean;          // 是否已执行清理
 };
 
-// 注册表使用内存 Map 存储
-const subagentRuns = new Map<string, SubagentRunRecord>();
+export type SubagentRunOutcome =
+  | { status: "success"; reply?: string }   // 成功完成，可能包含回复
+  | { status: "error"; error: string }      // 执行出错
+  | { status: "timeout" }                   // 超时终止
+  | { status: "cancelled" };                // 被取消
 ```
 
-**核心功能**:
+#### Registry 核心操作
 
-| 功能 | 描述 |
+| 操作 | 说明 |
 |------|------|
-| `registerSubagentRun()` | 注册新的 subagent 运行 |
-| `waitForSubagentCompletion()` | 等待运行完成 |
-| `beginSubagentCleanup()` | 开始清理流程 |
-| `finalizeSubagentCleanup()` | 完成清理 |
-| `persistSubagentRuns()` | 持久化到磁盘 |
+| `registerSubagentRun(params)` | 创建新的 RunRecord，分配 runId，持久化并返回 |
+| `waitForSubagentCompletion(runId)` | 阻塞等待指定 run 完成（带超时） |
+| `beginSubagentCleanup(runId)` | 标记开始清理，根据 cleanup 策略执行删除或归档 |
+| `finalizeSubagentCleanup(runId)` | 完成清理，设置 cleanupCompletedAt |
+| `persistSubagentRuns()` | 将内存 Map 序列化为 JSON 写入磁盘 |
+| `loadSubagentRuns()` | 启动时从磁盘恢复 RunRecord 到内存 |
 
-### Sessions Spawn Tool (工具)
+---
+
+### sessions_spawn Tool
 
 **文件**: `sessions-spawn-tool.ts`
 
-这是 Agent 调用 subagent 的入口工具。
+`sessions_spawn` 是 Agent 调用 Subagent 的唯一入口工具。
 
-```typescript
-// 工具定义
-export function createSessionsSpawnTool(opts?: {
-  agentSessionKey?: string;
-  agentChannel?: GatewayMessageChannel;
-  agentAccountId?: string;
-  agentTo?: string;
-  agentThreadId?: string | number;
-  agentGroupId?: string | null;
-  agentGroupChannel?: string | null;
-  agentGroupSpace?: string | null;
-  sandboxed?: boolean;
-  requesterAgentIdOverride?: string;
-}): AnyAgentTool {
-  return {
-    label: "Sessions",
-    name: "sessions_spawn",
-    description:
-      "Spawn a background sub-agent run in an isolated session and announce the result back to the requester chat.",
-    parameters: SessionsSpawnToolSchema,
-    execute: async (_toolCallId, args) => {
-      // 实现逻辑...
-    },
-  };
-}
-```
-
-**参数定义**:
+#### 参数定义
 
 ```typescript
 const SessionsSpawnToolSchema = Type.Object({
-  task: Type.String(),                           // 任务描述（必填）
-  label: Type.Optional(Type.String()),            // 任务标签
-  agentId: Type.Optional(Type.String()),         // 目标 Agent ID
-  model: Type.Optional(Type.String()),           // 模型选择
-  thinking: Type.Optional(Type.String()),        // Thinking 模式
-  runTimeoutSeconds: Type.Optional(Type.Number({ minimum: 0 })), // 超时时间
-  cleanup: optionalStringEnum(["delete", "keep"] as const), // 清理策略
+  task: Type.String(),              // 【必填】任务描述，作为子代理的初始 prompt
+  agentId: Type.Optional(           // 目标 Agent ID，不指定则使用请求者自身的 Agent
+    Type.String()
+  ),
+  model: Type.Optional(             // 模型选择（覆盖默认模型配置）
+    Type.String()
+  ),
+  cleanup: optionalStringEnum(      // 清理策略，默认 "delete"
+    ["delete", "keep"] as const
+  ),
+  label: Type.Optional(             // 任务标签，方便识别和检索
+    Type.String()
+  ),
+  runTimeoutSeconds: Type.Optional(  // 超时时间（秒），0 或不填表示无限制
+    Type.Number({ minimum: 0 })
+  ),
 });
 ```
 
-### Announce System (通知系统)
+#### 返回值
 
-**文件**: `subagent-announce.ts`
-
-负责将子代理的执行结果通知回主会话。
-
-```typescript
-// 通知队列项
-export type AnnounceQueueItem = {
-  prompt: string;                    // 通知消息
-  summaryLine?: string;              // 摘要行
-  enqueuedAt: number;               // 入队时间
-  sessionKey: string;               // 会话 Key
-  origin?: DeliveryContext;         // 原始上下文
-  originKey?: string;               // 原始 Key
-};
-
-// 结果类型
-export type SubagentRunOutcome =
-  | { status: "success"; reply?: string }
-  | { status: "error"; error: string }
-  | { status: "timeout" }
-  | { status: "cancelled" };
-```
-
-### Queue System (队列系统)
-
-**文件**: `subagent-announce-queue.ts`
-
-管理通知消息的队列，支持多种队列模式。
-
-```typescript
-// 队列状态
-type AnnounceQueueState = {
-  items: AnnounceQueueItem[];       // 队列项
-  draining: boolean;                // 是否正在排空
-  lastEnqueuedAt: number;         // 最后入队时间
-  mode: QueueMode;                 // 队列模式
-  debounceMs: number;              // 防抖时间
-  cap: number;                     // 队列上限
-  dropPolicy: QueueDropPolicy;      // 丢弃策略
-  droppedCount: number;             // 丢弃数量
-  summaryLines: string[];          // 摘要行
-  send: (item: AnnounceQueueItem) => Promise<void>; // 发送函数
-};
-```
-
-**队列模式**:
-
-| 模式 | 描述 |
-|------|------|
-| `collect` | 收集多条消息后合并 |
-| `steer` | 转向（优先）处理 |
-| `followup` | 跟进模式 |
-| `interrupt` | 中断当前任务 |
-| `backlog` | 积压处理 |
-
----
-
-## 生命周期
-
-### Spawn 流程
-
-```mermaid
-flowchart TD
-    A[Agent 调用 sessions_spawn] --> B[验证请求者权限]
-    B --> C{验证通过?}
-    C -->|否| D[返回错误]
-    C -->|是| E[解析会话 Key]
-    E --> F[确定目标 Agent]
-    F --> G[选择模型]
-    G --> H[注册到 Registry]
-    H --> I[持久化到磁盘]
-    I --> J[调用 Gateway 启动子代理]
-```
-
-**源码关键步骤**:
-
-```typescript
-// 1. 权限验证
-const allowAgents = resolveAgentConfig(cfg, requesterAgentId)?.subagents?.allowAgents ?? [];
-const allowAny = allowAgents.some((value) => value.trim() === "*");
-if (!allowAny && !allowAgents.includes(targetAgentId)) {
-  return jsonResult({
-    status: "forbidden",
-    error: `Agent "${targetAgentId}" is not allowed`,
-  });
-}
-
-// 2. 会话 Key 解析
-const requesterInternalKey = resolveInternalSessionKey({
-  key: requesterSessionKey,
-  alias,
-  mainKey,
-});
-
-// 3. 模型选择（优先级）
-const modelConfig = await resolveSubagentModelConfig({
-  cfg,
-  requesterAgentId,
-  targetAgentId,
-  explicitOverride: modelOverride,
-});
-
-// 4. 注册运行记录
-const { runId, childSessionKey } = await registerSubagentRun({
-  childSessionKey,
-  requesterSessionKey,
-  requesterOrigin,
-  requesterDisplayKey,
-  task,
-  cleanup,
-  label,
-});
-```
-
-### 执行阶段
-
-```mermaid
-stateDiagram-v2
-    [*] --> Registered: 注册完成
-    Registered --> Running: Gateway 启动
-    Running --> Completed: 正常完成
-    Running --> Timeout: 超时
-    Running --> Cancelled: 被取消
-    Completed --> Notified: 通知已发送
-    Notified --> CleanupPending: 等待清理
-    Timeout --> Notified: 通知超时
-    Cancelled --> Notified: 通知取消
-    CleanupPending --> Cleaned: 清理完成
-    Cleaned --> [*]
-```
-
-### 结果通知
-
-```mermaid
-sequenceDiagram
-    Note over Subagent, Gateway: 任务完成阶段
-    Subagent->>Gateway: 返回执行结果
-    Gateway->>AnnounceQueue: 入队通知请求
-    
-    Note over AnnounceQueue: 队列处理
-    AnnounceQueue->>QueueHelpers: 应用队列策略
-    QueueHelpers-->>AnnounceQueue: 处理后的消息
-    
-    AnnounceQueue->>Gateway: 发送通知
-    Gateway->>MainSession: 投递到主会话
-    
-    Note over MainSession: 用户收到结果
-```
-
-**队列处理逻辑**:
-
-```typescript
-async function scheduleAnnounceDrain(key: string) {
-  const queue = ANNOUNCE_QUEUES.get(key);
-  if (!queue || queue.draining) return;
-  
-  queue.draining = true;
-  
-  while (queue.items.length > 0 || queue.droppedCount > 0) {
-    await waitForQueueDebounce(queue);
-    
-    if (queue.mode === "collect") {
-      // 收集模式：合并多条消息
-      const items = queue.items.splice(0, queue.items.length);
-      const summary = buildQueueSummaryPrompt({ state: queue });
-      const prompt = buildCollectPrompt({ items, summary });
-      await queue.send({ ...items[0], prompt });
-    } else if (queue.mode === "steer") {
-      // 转向模式：优先处理
-      const next = queue.items.shift();
-      if (next) await queue.send(next);
-    }
-    // ... 其他模式
-  }
-}
-```
-
-### 清理阶段
-
-```mermaid
-flowchart LR
-    A[运行结束] --> B{cleanup=?}
-    B -->|delete| C[删除子会话]
-    B -->|keep| D[保留会话存档]
-    C --> E[从 Registry 移除]
-    D --> F[标记为已归档]
-    E --> G[清理完成]
-    F --> G
-```
-
-**清理逻辑**:
-
-```typescript
-async function cleanupSubagentRun(params: {
-  runId: string;
-  outcome: SubagentRunOutcome;
-  lastMessage?: string;
-  usage?: SubagentUsage;
-}) {
-  const entry = subagentRuns.get(params.runId);
-  if (!entry) return;
-  
-  // 更新运行记录
-  entry.outcome = params.outcome;
-  entry.endedAt = Date.now();
-  
-  if (params.usage) {
-    entry.usage = params.usage;
-  }
-  
-  // 执行清理
-  if (entry.cleanup === "delete") {
-    await deleteSubagentSession(entry.childSessionKey);
-    subagentRuns.delete(params.runId);
-  } else {
-    // 保留，标记归档时间
-    entry.archiveAtMs = resolveArchiveAfterMs();
-  }
-  
-  persistSubagentRuns();
-}
-```
-
----
-
-## 关键机制
-
-### 跨代理生成
-
-Subagent 支持指定不同的 Agent 来执行任务：
-
-```typescript
-// 配置允许的 Agent 列表
-{
-  agents: {
-    list: [
-      {
-        id: "research-agent",
-        subagents: {
-          allowAgents: ["coding-agent", "analysis-agent"],  // 允许调用这些 Agent
-        },
-      },
-    ],
-  },
-}
-
-// 跨代理调用
-await sessions_spawn({
-  task: "分析这段代码",
-  agentId: "coding-agent",  // 指定使用 coding-agent
-});
-```
-
-### 模型选择策略
-
-模型选择遵循优先级：
-
-```mermaid
-flowchart TD
-    A[模型选择] --> B{显式指定?}
-    B -->|是| C[使用指定的模型]
-    B -->|否| D[Agent 级别配置]
-    D --> E{配置了 subagentModel?}
-    E -->|是| F[使用 Agent 配置的模型]
-    E -->|否| G[使用全局默认模型]
-```
-
-```typescript
-async function resolveSubagentModelConfig(params) {
-  // 1. 优先使用显式指定
-  if (params.explicitOverride) {
-    return { model: params.explicitOverride };
-  }
-  
-  // 2. 检查目标 Agent 的配置
-  const agentConfig = resolveAgentConfig(params.cfg, params.targetAgentId);
-  if (agentConfig?.subagents?.model) {
-    return { model: agentConfig.subagents.model };
-  }
-  
-  // 3. 检查请求者 Agent 的配置
-  const requesterConfig = resolveAgentConfig(params.cfg, params.requesterAgentId);
-  if (requesterConfig?.subagents?.model) {
-    return { model: requesterConfig.subagents.model };
-  }
-  
-  // 4. 使用全局默认
-  return undefined;
-}
-```
-
-### 超时控制
-
-```typescript
-function resolveSubagentWaitTimeoutMs(
-  cfg: ReturnType<typeof loadConfig>,
-  runTimeoutSeconds?: number,
-) {
-  // 优先级：参数 > Agent 配置 > 全局默认
-  const explicit = runTimeoutSeconds;  // 传入的超时参数
-  
-  if (explicit !== undefined && explicit > 0) {
-    return explicit * 1000;  // 转换为毫秒
-  }
-  
-  const configTimeout = cfg.agents?.defaults?.subagents?.runTimeoutMinutes;
-  if (configTimeout && configTimeout > 0) {
-    return configTimeout * 60 * 1000;
-  }
-  
-  return 0;  // 无限制
-}
-```
-
-### 持久化与恢复
-
-```mermaid
-flowchart TD
-    A[启动时] --> B[从磁盘加载 Registry]
-    B --> C{有运行记录?}
-    C -->|否| D[正常运行]
-    C -->|是| E[恢复运行]
-    
-    E --> F{运行已结束?}
-    F -->|是| G[重新发送通知]
-    F -->|否| H[等待完成]
-    
-    H --> I{重启后继续等待}
-    I --> J[超时检查]
-```
-
-**持久化文件**:
-
-```typescript
-// subagent-registry.store.ts
-
-// 存储路径
-function resolveSubagentRegistryPath(): string {
-  return path.join(STATE_DIR, "subagents", "runs.json");
-}
-
-// 数据格式 (版本 2)
-type PersistedSubagentRegistryV2 = {
-  version: 2;                           // 版本号
-  runs: Record<string, SubagentRunRecord>;  // 运行记录
-};
-```
-
----
-
-## 配置选项
-
-### 全局配置
+调用成功时返回：
 
 ```typescript
 {
-  agents: {
-    defaults: {
-      subagents: {
-        // 允许跨 Agent 调用
-        allowAgents?: string[];
-        
-        // 子代理默认模型
-        model?: string;
-        
-        // 超时时间（分钟）
-        runTimeoutMinutes?: number;
-        
-        // 归档前的等待时间（分钟）
-        archiveAfterMinutes?: number;
-      },
-    },
-  },
+  status: "success",
+  runId: string,           // 可用于后续查询状态
+  childSessionKey: string  // 子会话标识
 }
 ```
 
-### Agent 级别配置
+#### 执行流程
 
 ```typescript
-{
-  agents: {
-    list: [
-      {
-        id: "my-agent",
-        subagents: {
-          // 允许调用的 Agent 列表
-          allowAgents: ["research-agent", "coding-agent"],
-          
-          // 指定子代理使用特定模型
-          model: "claude-sonnet-4",
-          
-          // 超时时间
-          runTimeoutMinutes: 30,
-        },
-      },
-    ],
-  },
-}
-```
-
-### 队列配置
-
-```typescript
-{
-  autoReply: {
-    queue: {
-      // 默认队列模式
-      mode: "collect" | "steer" | "followup" | "interrupt" | "backlog";
-      
-      // 防抖时间（毫秒）
-      debounceMs?: number;
-      
-      // 队列上限
-      cap?: number;
-      
-      // 超出上限时的策略
-      dropPolicy?: "summarize" | "keep" | "drop-old" | "drop-new";
-    },
-  },
-}
-```
-
----
-
-## 使用示例
-
-### 基本使用
-
-```typescript
-// 启动一个简单的子代理任务
-await sessions_spawn({
-  task: "搜索关于 React 18 新特性的信息并总结",
-});
-
-// 带标签的任務
-await sessions_spawn({
-  task: "分析这个 PR 的代码变更",
-  label: "PR 分析",
-});
-```
-
-### 高级使用
-
-```typescript
-// 指定 Agent 和模型
-await sessions_spawn({
-  task: "写一个 Python 脚本处理 CSV 文件",
-  agentId: "coding-agent",
-  model: "claude-sonnet-4",
-});
-
-// 设置超时
-await sessions_spawn({
-  task: "深度分析这个代码库",
-  runTimeoutSeconds: 300,  // 5 分钟
-  cleanup: "keep",          // 保留会话供后续查看
-});
-
-// 指定清理策略
-await sessions_spawn({
-  task: "生成技术报告",
-  cleanup: "delete",  // 完成后删除子会话
-});
-```
-
-### 从配置文件
-
-```yaml
-# openclaw.yaml
-agents:
-  defaults:
-    subagents:
-      allowAgents:
-        - research-agent
-        - coding-agent
-      model: claude-sonnet-4
-      runTimeoutMinutes: 30
-
-  list:
-    - id: assistant
-      subagents:
-        allowAgents: ["*"]  # 允许所有 Agent
-```
-
----
-
-## 源码关键代码解读
-
-### 1. 注册 Subagent 运行
-
-```typescript
-// subagent-registry.ts
-
-export async function registerSubagentRun(params: {
-  childSessionKey: string;
-  requesterSessionKey: string;
-  requesterOrigin?: DeliveryContext;
-  requesterDisplayKey: string;
-  task: string;
-  cleanup: "delete" | "keep";
-  label?: string;
-}): Promise<{ runId: string; childSessionKey: string }> {
-  const runId = crypto.randomUUID();
-  
-  const entry: SubagentRunRecord = {
-    runId,
-    childSessionKey: params.childSessionKey,
-    requesterSessionKey: params.requesterSessionKey,
-    requesterOrigin: params.requesterOrigin,
-    requesterDisplayKey: params.requesterDisplayKey,
-    task: params.task,
-    cleanup: params.cleanup,
-    label: params.label,
-    createdAt: Date.now(),
-  };
-  
-  // 添加到注册表
-  subagentRuns.set(runId, entry);
-  
-  // 持久化
-  persistSubagentRuns();
-  
-  // 确保清理监听器已启动
-  ensureListener();
-  
-  return { runId, childSessionKey: params.childSessionKey };
-}
-```
-
-### 2. Spawn 工具执行
-
-```typescript
-// sessions-spawn-tool.ts
-
 execute: async (_toolCallId, args) => {
-  // 1. 解析参数
+  // 1. 参数解析
   const task = readStringParam(params, "task", { required: true });
-  const label = typeof params.label === "string" ? params.label.trim() : "";
-  
-  // 2. 权限检查
+
+  // 2. 嵌套检查 —— 子代理内部不允许再 spawn
   if (isSubagentSessionKey(requesterSessionKey)) {
     return jsonResult({
       status: "forbidden",
       error: "sessions_spawn is not allowed from sub-agent sessions",
     });
   }
-  
+
   // 3. 确定目标 Agent
   const targetAgentId = requestedAgentId
     ? normalizeAgentId(requestedAgentId)
     : requesterAgentId;
-  
-  // 4. 检查权限
-  const allowAgents = resolveAgentConfig(cfg, requesterAgentId)?.subagents?.allowAgents ?? [];
+
+  // 4. 权限校验（allowAgents 白名单）
+  const allowAgents = resolveAgentConfig(cfg, requesterAgentId)
+    ?.subagents?.allowAgents ?? [];
   const allowAny = allowAgents.some((v) => v.trim() === "*");
   if (!allowAny && !allowAgents.includes(targetAgentId)) {
     return jsonResult({
@@ -777,23 +237,21 @@ execute: async (_toolCallId, args) => {
       error: `Agent "${targetAgentId}" is not allowed`,
     });
   }
-  
-  // 5. 构建系统提示词
-  const systemPrompt = await buildSubagentSystemPrompt({
-    task,
-    modelConfig,
-    agentId: targetAgentId,
-    subagentModelConfig,
-    requesterDisplayKey,
-    thinkingOverrideRaw,
-    cfg,
-    requesterOrigin,
-    label,
+
+  // 5. 模型解析（显式指定 > Agent 配置 > 全局默认）
+  const modelConfig = await resolveSubagentModelConfig({
+    cfg, requesterAgentId, targetAgentId,
+    explicitOverride: modelOverride,
   });
-  
-  // 6. 注册并启动
-  const { runId, childSessionKey } = await registerSubagentRun({...});
-  
+
+  // 6. 注册到 Registry 并持久化
+  const { runId, childSessionKey } = await registerSubagentRun({
+    childSessionKey, requesterSessionKey,
+    requesterOrigin, requesterDisplayKey,
+    task, cleanup, label,
+  });
+
+  // 7. 通过 Gateway 启动子代理会话
   await callGateway({
     method: "agent",
     params: {
@@ -803,166 +261,539 @@ execute: async (_toolCallId, args) => {
       deliver: false,
     },
   });
-  
+
+  return jsonResult({ status: "success", runId, childSessionKey });
+}
+```
+
+---
+
+### Announce System
+
+**文件**: `subagent-announce.ts`
+
+Announce System 负责在 Subagent 完成后将结果通知回主会话。它是连接"隔离执行"与"结果可见"的桥梁。
+
+#### 投递模式
+
+Announce 支持两种投递模式：
+
+| 模式 | 行为 |
+|------|------|
+| `none` | 不发送任何通知（静默完成） |
+| `announce` | 将结果以消息形式投递到主会话的 Announce Queue |
+
+#### 通知消息结构
+
+```typescript
+export type AnnounceQueueItem = {
+  prompt: string;            // 通知消息正文（包含结果摘要）
+  summaryLine?: string;      // 一行式摘要（用于合并展示）
+  enqueuedAt: number;        // 入队时间戳
+  sessionKey: string;        // 目标会话 Key
+  origin?: DeliveryContext;  // 原始请求上下文
+  originKey?: string;        // 原始上下文 Key
+};
+```
+
+#### 实现路径
+
+```
+Subagent 完成
+  → cleanupSubagentRun() 更新 outcome
+  → buildAnnouncePrompt() 构建通知文本
+  → enqueueAnnounce() 入队到 Announce Queue
+  → scheduleAnnounceDrain() 按队列模式排空
+  → queue.send() 发送到主会话 Gateway
+  → 主会话收到结果通知并展示给用户
+```
+
+---
+
+### Queue Modes
+
+**文件**: `subagent-announce-queue.ts`
+
+Queue Modes 控制当多条 Announce 消息到达时如何投递到主会话。这是理解 Subagent 结果处理的关键，不同模式在**主会话正在运行**和**主会话空闲**时表现完全不同。
+
+#### 模式行为对比（核心）
+
+```mermaid
+graph LR
+    subgraph "消息到达时主会话状态"
+        A["🟢 空闲（无活跃 Run）"]
+        B["🔴 忙碌（正在 Run）"]
+    end
+
+    B --> C["steer: 追加到当前 Run 上下文"]
+    B --> D["followup: 排队等待"]
+    B --> E["collect: 缓冲收集"]
+    B --> F["interrupt: 终止当前 Run"]
+    B --> G["queue: FIFO 排队"]
+
+    A --> H["直接触发新 Run"]
+```
+
+| 模式 | 消息到达时主会话正在 Run | Run 完成后的行为 | 适用场景 |
+|------|------------------------|-----------------|---------|
+| **steer** | 追加到当前 Run 的上下文中，Agent 可以在执行中"看到"新消息并调整方向 | N/A（消息已融入当前 Run） | 需要实时调整正在进行的任务 |
+| **followup** | 排入队列，等待当前 Run 完成 | 自动作为新消息触发下一轮 Run | 异步通知，不打断当前工作 |
+| **collect** | 放入收集缓冲区，不立即投递 | 将缓冲区中所有消息合并为一条，一次性发送 | 高频短任务，避免消息轰炸 |
+| **interrupt** | 终止当前正在运行的 Run，立即以新消息启动新 Run | N/A（直接接管） | 紧急任务，需要立即处理 |
+| **steer-backlog** | 行为同 steer，将消息追加到当前上下文；如果上下文已满则溢出到 backlog | backlog 中的积压消息依次处理 | steer + 溢出保护 |
+| **steer+backlog** | steer 与 backlog 的组合策略 | 组合处理 | 复杂的混合场景 |
+| **queue** | 严格 FIFO 排队，一次只处理一条 | 队列中下一条消息开始处理 | 保证顺序的串行处理 |
+
+#### 队列状态结构
+
+```typescript
+type AnnounceQueueState = {
+  items: AnnounceQueueItem[];       // 待投递消息列表
+  draining: boolean;                // 是否正在排空队列
+  lastEnqueuedAt: number;           // 最后入队时间
+  mode: QueueMode;                  // 当前队列模式
+  debounceMs: number;               // 防抖间隔（毫秒）
+  cap: number;                      // 队列容量上限
+  dropPolicy: QueueDropPolicy;      // 超出上限时的丢弃策略
+  droppedCount: number;             // 已丢弃消息数
+  summaryLines: string[];           // 被丢弃消息的摘要
+  send: (item: AnnounceQueueItem) => Promise<void>;
+};
+```
+
+#### 排空逻辑
+
+```typescript
+async function scheduleAnnounceDrain(key: string) {
+  const queue = ANNOUNCE_QUEUES.get(key);
+  if (!queue || queue.draining) return;
+
+  queue.draining = true;
+
+  while (queue.items.length > 0 || queue.droppedCount > 0) {
+    await waitForQueueDebounce(queue);
+
+    if (queue.mode === "collect") {
+      // collect: 取出所有消息，合并为一条发送
+      const items = queue.items.splice(0, queue.items.length);
+      const summary = buildQueueSummaryPrompt({ state: queue });
+      const prompt = buildCollectPrompt({ items, summary });
+      await queue.send({ ...items[0], prompt });
+    } else if (queue.mode === "steer") {
+      // steer: 逐条发送，追加到当前上下文
+      const next = queue.items.shift();
+      if (next) await queue.send(next);
+    }
+    // ... 其他模式处理
+  }
+
+  queue.draining = false;
+}
+```
+
+---
+
+## Subagent 嵌套深度
+
+OpenClaw 通过 **Session Key 中的 `:subagent:` 段** 来跟踪 Subagent 的嵌套层级。
+
+### Session Key 结构
+
+每当一个 Subagent 被创建时，其 `childSessionKey` 会在请求者的 Session Key 基础上追加 `:subagent:` 段：
+
+```
+主会话:           user:123:chat:456
+第一层 Subagent:  user:123:chat:456:subagent:run-abc
+第二层 Subagent:  user:123:chat:456:subagent:run-abc:subagent:run-def
+```
+
+### 嵌套深度计算
+
+```typescript
+function getSubagentDepth(sessionKey: string): number {
+  // 计算 session key 中 ":subagent:" 段的数量
+  const segments = sessionKey.split(":subagent:");
+  return segments.length - 1;
+}
+
+// 示例
+getSubagentDepth("user:123:chat:456")                           // → 0（主会话）
+getSubagentDepth("user:123:chat:456:subagent:run-abc")          // → 1
+getSubagentDepth("user:123:chat:456:subagent:run-abc:subagent:run-def") // → 2
+```
+
+### 嵌套限制
+
+当前实现中，`sessions_spawn` 工具会检查请求者是否已经是 Subagent 会话，**禁止 Subagent 内部再次 spawn**：
+
+```typescript
+if (isSubagentSessionKey(requesterSessionKey)) {
   return jsonResult({
-    status: "success",
-    runId,
-    childSessionKey,
+    status: "forbidden",
+    error: "sessions_spawn is not allowed from sub-agent sessions",
   });
 }
 ```
 
-### 3. 通知队列处理
+`isSubagentSessionKey()` 通过检测 Session Key 中是否包含 `:subagent:` 段来判断：
 
 ```typescript
-// subagent-announce-queue.ts
+function isSubagentSessionKey(key: string): boolean {
+  return key.includes(":subagent:");
+}
+```
 
-function scheduleAnnounceDrain(key: string) {
-  const queue = ANNOUNCE_QUEUES.get(key);
-  if (!queue || queue.draining) return;
-  
-  queue.draining = true;
-  
-  void (async () => {
-    while (queue.items.length > 0 || queue.droppedCount > 0) {
-      await waitForQueueDebounce(queue);
-      
-      // collect 模式：合并消息
-      if (queue.mode === "collect") {
-        const items = queue.items.splice(0, queue.items.length);
-        const summary = buildQueueSummaryPrompt({ state: queue });
-        const prompt = buildCollectPrompt({ items, summary });
-        await queue.send({ ...items[0], prompt });
-        continue;
-      }
-      
-      // 其他模式...
-    }
-    queue.draining = false;
-  })();
+这意味着当前的**最大嵌套深度为 1**——只有主会话可以 spawn Subagent，Subagent 不能再创建子 Subagent。
+
+```mermaid
+graph TD
+    A["主会话 (depth=0)"] -->|"✅ 允许 spawn"| B["Subagent (depth=1)"]
+    B -->|"❌ 禁止 spawn"| C["Sub-Subagent (depth=2)"]
+
+    style C fill:#ff6b6b,stroke:#c92a2a,color:#fff
+```
+
+---
+
+## 跨 Agent 调用
+
+Subagent 最强大的能力之一是**跨 Agent 委派**——一个 Agent 可以 spawn 另一个专门的 Agent 来执行特定任务。
+
+### 权限控制
+
+跨 Agent 调用需要在配置中显式授权：
+
+```yaml
+agents:
+  list:
+    - id: orchestrator
+      subagents:
+        allowAgents:
+          - research-agent     # 允许调用 research-agent
+          - coding-agent       # 允许调用 coding-agent
+          # - "*"              # 取消注释以允许调用所有 Agent
+
+    - id: research-agent
+      subagents:
+        allowAgents: []        # 不允许调用任何其他 Agent
+```
+
+权限校验逻辑：
+
+```typescript
+const allowAgents = resolveAgentConfig(cfg, requesterAgentId)
+  ?.subagents?.allowAgents ?? [];
+
+const allowAny = allowAgents.some((value) => value.trim() === "*");
+
+if (!allowAny && !allowAgents.includes(targetAgentId)) {
+  return jsonResult({
+    status: "forbidden",
+    error: `Agent "${targetAgentId}" is not allowed`,
+  });
+}
+```
+
+### 模型选择策略
+
+跨 Agent 调用时的模型选择遵循严格的优先级链：
+
+```mermaid
+flowchart TD
+    A["模型选择"] --> B{"显式指定 model 参数?"}
+    B -->|"是"| C["使用 sessions_spawn 的 model 参数"]
+    B -->|"否"| D{"目标 Agent 配置了 subagentModel?"}
+    D -->|"是"| E["使用目标 Agent 的 subagentModel"]
+    D -->|"否"| F{"请求者 Agent 配置了 subagentModel?"}
+    F -->|"是"| G["使用请求者 Agent 的 subagentModel"]
+    F -->|"否"| H["使用全局默认模型"]
+
+    style C fill:#51cf66,stroke:#2b8a3e,color:#fff
+    style E fill:#74c0fc,stroke:#1971c2,color:#fff
+    style G fill:#ffd43b,stroke:#e67700
+    style H fill:#dee2e6,stroke:#868e96
+```
+
+```typescript
+async function resolveSubagentModelConfig(params) {
+  // 优先级 1: 显式指定
+  if (params.explicitOverride) {
+    return { model: params.explicitOverride };
+  }
+
+  // 优先级 2: 目标 Agent 配置
+  const targetConfig = resolveAgentConfig(params.cfg, params.targetAgentId);
+  if (targetConfig?.subagents?.model) {
+    return { model: targetConfig.subagents.model };
+  }
+
+  // 优先级 3: 请求者 Agent 配置
+  const requesterConfig = resolveAgentConfig(params.cfg, params.requesterAgentId);
+  if (requesterConfig?.subagents?.model) {
+    return { model: requesterConfig.subagents.model };
+  }
+
+  // 优先级 4: 全局默认
+  return undefined;
 }
 ```
 
 ---
 
-## 常见问题
+## 超时控制
 
-### Q1: Subagent 和普通会话有什么区别？
+### runTimeoutSeconds 参数
 
-| 方面 | Subagent | 普通会话 |
-|------|----------|---------|
-| **隔离** | 完全隔离的会话 | 共享会话 |
-| **生命周期** | 临时性，任务完成结束 | 持久性，长期运行 |
-| **结果返回** | 自动通知主会话 | 直接响应 |
-| **清理** | 可配置自动删除 | 手动管理 |
-
-### Q2: 如何控制 Subagent 的资源使用？
-
-```yaml
-# 1. 超时控制
-agents:
-  defaults:
-    subagents:
-      runTimeoutMinutes: 30  # 最多运行 30 分钟
-
-# 2. 并发控制
-agents:
-  defaults:
-    subagents:
-      maxConcurrent: 4  # 最大并发数
-
-# 3. 清理策略
-await sessions_spawn({
-  task: "...",
-  cleanup: "delete",  # 完成后立即删除
-});
-```
-
-### Q3: Subagent 崩溃后会发生什么？
-
-```
-1. 注册表持久化运行记录
-2. 系统重启后自动恢复
-3. 重新发送结果通知
-4. 如果通知也失败，会标记待处理
-```
-
-### Q4: 如何调试 Subagent？
+`sessions_spawn` 接受 `runTimeoutSeconds` 参数设置单次运行的最大执行时间：
 
 ```typescript
-// 1. 查看运行记录
-openclaw sessions list
-
-// 2. 查看特定运行详情
-openclaw sessions info <runId>
-
-// 3. 保留会话供调试
 await sessions_spawn({
-  task: "...",
-  cleanup: "keep",  # 保留会话
+  task: "深度分析代码库",
+  runTimeoutSeconds: 300,  // 5 分钟超时
 });
-
-// 4. 查看会话日志
-openclaw logs --session <sessionKey>
 ```
 
-### Q5: 队列模式如何选择？
+### 超时解析优先级
 
-| 场景 | 推荐模式 | 说明 |
-|------|---------|------|
-| 频繁短任务 | `steer` | 优先处理最新任务 |
-| 批量处理 | `collect` | 合并多条消息 |
-| 紧急通知 | `interrupt` | 中断当前任务 |
-| 历史记录 | `followup` | 作为跟进消息 |
+```typescript
+function resolveSubagentWaitTimeoutMs(
+  cfg: ReturnType<typeof loadConfig>,
+  runTimeoutSeconds?: number,
+) {
+  // 优先级 1: 参数级别（精确到秒）
+  if (runTimeoutSeconds !== undefined && runTimeoutSeconds > 0) {
+    return runTimeoutSeconds * 1000;
+  }
 
-### Q6: 如何限制可调用的 Agent？
+  // 优先级 2: Agent 配置级别（精确到分钟）
+  const configTimeout = cfg.agents?.defaults?.subagents?.runTimeoutMinutes;
+  if (configTimeout && configTimeout > 0) {
+    return configTimeout * 60 * 1000;
+  }
 
-```yaml
-agents:
-  list:
-    - id: research-agent
-      subagents:
-        allowAgents:  # 白名单
-          - coding-agent
-          - analysis-agent
+  // 优先级 3: 无限制
+  return 0;
+}
+```
+
+### 卡死检测
+
+当 Subagent 超时后，系统会：
+
+1. 将 `outcome` 设置为 `{ status: "timeout" }`
+2. 设置 `endedAt` 时间戳
+3. 通过 Announce System 通知主会话超时信息
+4. 根据 `cleanup` 策略执行清理
+
+```typescript
+// 超时处理
+if (timeoutMs > 0) {
+  setTimeout(async () => {
+    const entry = subagentRuns.get(runId);
+    if (entry && !entry.endedAt) {
+      entry.outcome = { status: "timeout" };
+      entry.endedAt = Date.now();
+      persistSubagentRuns();
+      await enqueueAnnounce(/* timeout notification */);
+    }
+  }, timeoutMs);
+}
 ```
 
 ---
 
-## 总结
+## 持久化与恢复
 
-OpenClaw Subagent 机制核心要点：
+### 持久化机制
 
-### 架构设计
+所有 `SubagentRunRecord` 在每次状态变更时写入磁盘：
 
-1. **分离执行** - 主代理和子代理完全隔离
-2. **自动通知** - 结果自动返回主会话
-3. **持久化** - 支持崩溃恢复
-4. **灵活队列** - 多种通知模式
+```typescript
+// subagent-registry.store.ts
 
-### 最佳实践
+function resolveSubagentRegistryPath(): string {
+  return path.join(STATE_DIR, "subagents", "runs.json");
+}
+
+// 磁盘数据格式（版本 2）
+type PersistedSubagentRegistryV2 = {
+  version: 2;
+  runs: Record<string, SubagentRunRecord>;
+};
+```
+
+### 恢复流程
+
+系统重启时的恢复逻辑：
+
+```mermaid
+flowchart TD
+    A["系统启动"] --> B["loadSubagentRuns()"]
+    B --> C["从 runs.json 加载记录"]
+    C --> D{"遍历每条 RunRecord"}
+
+    D --> E{"endedAt 已设置?"}
+    E -->|"是（已结束）"| F{"cleanupHandled?"}
+    F -->|"否"| G["重新触发 Announce 通知"]
+    F -->|"是"| H["跳过（已处理完毕）"]
+
+    E -->|"否（未结束）"| I{"是否超时?"}
+    I -->|"是"| J["标记 timeout + 触发通知"]
+    I -->|"否"| K["继续等待完成"]
+
+    G --> L["恢复清理流程"]
+    J --> L
+    K --> M["重新注册超时监听"]
+```
+
+关键恢复行为：
+
+| 场景 | 恢复动作 |
+|------|---------|
+| Run 已结束但通知未发送 | 重新入队 Announce |
+| Run 已结束且已通知但未清理 | 执行清理（delete/archive） |
+| Run 未结束且未超时 | 继续等待，重新注册超时计时器 |
+| Run 未结束且已超时 | 标记 timeout，发送通知，执行清理 |
+
+---
+
+## 完整生命周期
+
+### 生命周期阶段
+
+```
+Spawn → Execute → Result → Announce → Cleanup
+```
+
+### 生命周期状态机
+
+```mermaid
+stateDiagram-v2
+    [*] --> Registered: registerSubagentRun()
+
+    Registered --> Running: Gateway 启动子会话
+
+    Running --> Success: 正常完成
+    Running --> Error: 执行出错
+    Running --> Timeout: 超时终止
+    Running --> Cancelled: 被取消
+
+    Success --> Announcing: enqueueAnnounce()
+    Error --> Announcing: enqueueAnnounce()
+    Timeout --> Announcing: enqueueAnnounce()
+    Cancelled --> Announcing: enqueueAnnounce()
+
+    Announcing --> Announced: 通知投递成功
+
+    Announced --> Cleaning: beginSubagentCleanup()
+
+    Cleaning --> Deleted: cleanup="delete"
+    Cleaning --> Archived: cleanup="keep"
+
+    Deleted --> [*]
+    Archived --> [*]
+```
+
+### 完整时序图
+
+```mermaid
+sequenceDiagram
+    actor User as 用户
+    participant Main as 主 Agent
+    participant Spawn as sessions_spawn
+    participant Registry as Registry
+    participant Disk as 磁盘
+    participant GW as Gateway
+    participant Sub as Subagent
+    participant Queue as Announce Queue
+
+    User->>Main: 发起任务请求
+    Main->>Spawn: sessions_spawn(task, ...)
+
+    rect rgb(240, 248, 255)
+        Note over Spawn,Registry: Phase 1: Spawn
+        Spawn->>Spawn: 权限校验 + 模型解析
+        Spawn->>Registry: registerSubagentRun()
+        Registry->>Disk: persistSubagentRuns()
+        Spawn->>GW: agent(childSessionKey, prompt)
+        Spawn-->>Main: { status: "success", runId }
+    end
+
+    rect rgb(255, 248, 240)
+        Note over GW,Sub: Phase 2: Execute
+        GW->>Sub: 创建隔离会话
+        Sub->>Sub: 执行任务（独立运行）
+        Sub->>Sub: 调用工具、推理...
+        Sub-->>GW: 返回最终结果
+    end
+
+    rect rgb(240, 255, 240)
+        Note over GW,Queue: Phase 3: Result + Announce
+        GW->>Registry: 更新 outcome + endedAt
+        Registry->>Disk: persistSubagentRuns()
+        GW->>Queue: enqueueAnnounce(result)
+        Queue->>Queue: 应用队列模式策略
+        Queue->>Main: 投递结果通知
+    end
+
+    rect rgb(255, 240, 255)
+        Note over Main,Disk: Phase 4: Cleanup
+        Main->>Registry: beginSubagentCleanup(runId)
+        alt cleanup = "delete"
+            Registry->>GW: deleteSession(childSessionKey)
+            Registry->>Registry: subagentRuns.delete(runId)
+        else cleanup = "keep"
+            Registry->>Registry: archiveAtMs = now + archiveAfter
+        end
+        Registry->>Disk: persistSubagentRuns()
+    end
+
+    Main-->>User: 展示子代理执行结果
+```
+
+---
+
+## 配置速查
+
+### 全局默认配置
 
 ```yaml
-# 推荐配置
 agents:
   defaults:
     subagents:
-      model: claude-sonnet-4
-      runTimeoutMinutes: 30
-      archiveAfterMinutes: 60
-
-autoReply:
-  queue:
-    mode: collect
-    debounceMs: 500
-    cap: 20
+      allowAgents: []               # 默认不允许跨 Agent 调用
+      model: claude-sonnet-4        # 子代理默认模型
+      runTimeoutMinutes: 30         # 默认超时（分钟）
+      archiveAfterMinutes: 60       # 归档前等待时间
 ```
 
-### 使用建议
+### Agent 级别配置
 
-1. **复杂任务** - 使用 subagent 处理耗时任务
-2. **专业化** - 指定专门的 Agent 处理特定任务
-3. **资源控制** - 设置合理的超时和清理策略
-4. **监控** - 定期检查 subagent 运行状态
+```yaml
+agents:
+  list:
+    - id: orchestrator
+      subagents:
+        allowAgents: ["*"]          # 允许调用所有 Agent
+        model: claude-sonnet-4      # 该 Agent 的子代理模型
 
-掌握这些概念，就能高效使用 OpenClaw 的 Subagent 机制！
+    - id: research-agent
+      subagents:
+        allowAgents:                # 白名单
+          - coding-agent
+```
+
+### 队列配置
+
+```yaml
+autoReply:
+  queue:
+    mode: collect                   # 队列模式
+    debounceMs: 500                 # 防抖间隔
+    cap: 20                         # 队列容量上限
+    dropPolicy: summarize           # 溢出策略: summarize | keep | drop-old | drop-new
+```
+
+---
+
+*基于 OpenClaw v2026.2.3-1 源码分析*

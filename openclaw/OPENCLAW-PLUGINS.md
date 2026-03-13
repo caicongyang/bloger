@@ -1,955 +1,599 @@
 # OpenClaw 插件系统源码深度分析
 
-> 基于源码的全面解析，帮助你深入理解 OpenClaw 的插件架构
+> 基于源码的全面解析，深入剖析 OpenClaw 插件架构的每一个关键环节
 
 ## 目录
 
-- [概述](#概述)
-- [架构设计](#架构设计)
-- [核心概念](#核心概念)
-  - [插件类型](#插件类型)
-  - [插件注册表](#插件注册表)
-  - [插件生命周期](#插件生命周期)
-- [插件发现与加载](#插件发现与加载)
-  - [发现机制](#发现机制)
-  - [加载流程](#加载流程)
-  - [模块解析](#模块解析)
+- [设计理念](#设计理念)
+- [插件发现与安全检查](#插件发现与安全检查)
+- [Manifest Registry](#manifest-registry)
+- [加载管线](#加载管线-loaderts)
+- [Plugin Registry](#plugin-registry-registryts)
 - [通道插件](#通道插件)
-  - [通道接口](#通道接口)
-  - [适配器模式](#适配器模式)
-  - [配置管理](#配置管理)
-- [工具插件](#工具插件)
-  - [工具工厂](#工具工厂)
-  - [上下文传递](#上下文传递)
-- [钩子系统](#钩子系统)
-  - [钩子类型](#钩子类型)
-  - [执行机制](#执行机制)
-  - [优先级排序](#优先级排序)
-- [运行时集成](#运行时集成)
-  - [PluginRuntime](#pluginruntime)
-  - [服务注入](#服务注入)
-  - [依赖管理](#依赖管理)
+- [Hook 系统](#hook-系统)
+- [插件运行时](#插件运行时)
+- [插件 HTTP 路由](#插件-http-路由)
+- [插件服务生命周期](#插件服务生命周期)
 - [配置与状态](#配置与状态)
-  - [配置模式](#配置模式)
-  - [状态管理](#状态管理)
-- [使用指南](#使用指南)
-  - [创建插件](#创建插件)
-  - [注册插件](#注册插件)
-  - [插件开发最佳实践](#插件开发最佳实践)
-- [源码关键代码解读](#源码关键代码解读)
 - [常见问题](#常见问题)
 
 ---
 
-## 概述
+## 设计理念
 
-OpenClaw 的插件系统是一个**高度模块化的扩展框架**，支持：
+OpenClaw 的插件系统遵循三大核心原则：
 
-1. **通道插件** - 支持多种消息通道（Telegram、WhatsApp、Discord 等）
-2. **工具插件** - 扩展 Agent 工具集
-3. **钩子插件** - 拦截和修改系统行为
-4. **命令插件** - 添加自定义命令
-5. **HTTP 处理器** - 提供 HTTP API 接口
+### 模块化可扩展
 
-### 系统定位
+在 OpenClaw 中，**一切皆插件**——通道（Channel）、工具（Tool）、Hook、Provider、HTTP 路由都以插件形式存在。这种设计使系统具备高度的可组合性，开发者可以按需组装功能模块，而不必修改核心代码。
+
+### 安全优先
+
+插件安全不是事后补救，而是**在发现阶段就前置检查**。系统会在扫描插件候选时立即校验路径安全性，包括路径逃逸检测、世界可写目录检查、文件所有权验证等，将不安全的插件拦截在加载之前。
+
+### 热加载
+
+通过 [Jiti](https://github.com/unjs/jiti) 运行时模块加载器，OpenClaw 可以直接加载 `.ts`、`.js`、`.mts`、`.cts`、`.mjs`、`.cjs` 等多种格式的插件文件，无需预编译步骤，极大提升了开发体验。
 
 ```mermaid
 graph TB
-    subgraph "OpenClaw Core"
-        A[Gateway] --> B[Plugin System]
-        B --> C[Channel Manager]
-        B --> D[Tool Registry]
-        B --> E[Hook Runner]
-        B --> F[Command Registry]
+    subgraph "OpenClaw 插件体系"
+        A[Gateway 网关] --> B[Plugin System 插件系统]
+        B --> C[Channel Manager 通道管理]
+        B --> D[Tool Registry 工具注册]
+        B --> E[Hook Runner 钩子执行]
+        B --> F[Provider Registry 提供商注册]
+        B --> G[HTTP Route Handler 路由处理]
+        B --> H[Service Manager 服务管理]
     end
     
-    subgraph "Plugins"
-        C --> G[Telegram Plugin]
-        C --> H[WhatsApp Plugin]
-        C --> I[Discord Plugin]
-        D --> J[Custom Tools]
-        E --> K[Lifecycle Hooks]
-        F --> L[Custom Commands]
+    subgraph "插件类型"
+        C --> C1[Telegram]
+        C --> C2[WhatsApp]
+        C --> C3[Discord]
+        C --> C4[Slack / 更多...]
+        D --> D1[自定义工具]
+        E --> E1[生命周期 Hook]
+        F --> F1[模型 Provider]
+        G --> G1[Webhook 端点]
+        H --> H1[后台服务]
     end
     
-    subgraph "Runtime"
-        B --> M[Plugin Runtime]
-        M --> N[Config Service]
-        M --> O[Logger]
-        M --> P[Storage]
+    subgraph "运行时注入"
+        B --> R[Plugin Runtime]
+        R --> R1[Config 配置]
+        R --> R2[Logger 日志]
+        R --> R3[Storage 存储]
+        R --> R4[Events 事件]
+        R --> R5[HTTP Client]
     end
 ```
-
-### 核心特性
 
 | 特性 | 描述 |
 |------|------|
-| **多类型插件** | 通道、工具、钩子、命令、HTTP |
-| **动态加载** | 支持本地、npm、git 源 |
-| **懒加载** | 按需导入，避免启动开销 |
-| **依赖注入** | 通过 Runtime 注入服务 |
-| **版本管理** | 支持版本锁定和更新检查 |
-| **沙箱隔离** | 可选的沙箱执行环境 |
+| **一切皆插件** | 通道、工具、Hook、Provider、HTTP 路由、CLI、服务均为插件 |
+| **安全前置** | 发现阶段即检查路径逃逸、权限、所有权 |
+| **热加载** | Jiti 运行时直接加载 .ts/.js，无需预编译 |
+| **依赖注入** | 通过 Plugin Runtime 注入 config、logger、storage、services、events |
+| **缓存加速** | Discovery 缓存 ~1s TTL，Registry 可缓存 |
+| **优先级覆盖** | workspace > managed > bundled > extra，局部覆盖全局 |
 
 ---
 
-## 架构设计
+## 插件发现与安全检查
 
-### 模块结构
+### 发现来源优先级
+
+插件发现按以下优先级依次扫描，优先级从高到低：
 
 ```
-src/plugins/
-├── types.ts              # 类型定义
-├── registry.ts           # 插件注册表
-├── discovery.ts         # 插件发现
-├── loader.ts            # 插件加载器
-├── manifest.ts          # 插件清单
-├── config-state.ts      # 配置状态
-├── hooks.ts            # 钩子系统
-├── commands.ts          # 命令注册
-├── tools.ts            # 工具注册
-├── install.ts           # 安装管理
-├── update.ts            # 更新检查
-├── runtime/             # 运行时
-│   └── index.ts        # PluginRuntime
-└── channels/           # 通道管理
+config（用户配置目录）> workspace（工作区）> global（全局目录）> bundled/stock（内置插件）
 ```
 
-### 组件交互
-
-```mermaid
-classDiagram
-    class PluginSystem {
-        +discover()
-        +load()
-        +register()
-        +start()
-        +stop()
-    }
-    
-    class PluginRegistry {
-        +plugins: PluginRecord[]
-        +tools: PluginToolRegistration[]
-        +hooks: PluginHookRegistration[]
-        +channels: ChannelRegistration[]
-        +commands: CommandRegistration[]
-    }
-    
-    class PluginLoader {
-        +loadModule()
-        +validatePlugin()
-        +initialize()
-    }
-    
-    class PluginRuntime {
-        +config
-        +logger
-        +storage
-        +services
-    }
-    
-    class HookRunner {
-        +register()
-        +execute()
-        +prioritize()
-    }
-    
-    PluginSystem --> PluginRegistry
-    PluginSystem --> PluginLoader
-    PluginSystem --> PluginRuntime
-    PluginLoader --> HookRunner
-```
-
----
-
-## 核心概念
-
-### 插件类型
+### `discoverInDirectory()` 扫描机制
 
 ```typescript
-// types.ts
-
-export type PluginKind = "memory";
-
-// 插件定义结构
-export type OpenClawPluginDefinition = {
-  id: string;                    // 插件唯一标识
-  name?: string;                 // 显示名称
-  version?: string;              // 版本号
-  description?: string;           // 描述
-  
-  // 注册项
-  channels?: ChannelPlugin[];   // 通道插件
-  tools?: ToolFactory[];         // 工具插件
-  hooks?: HookEntry[];           // 钩子插件
-  commands?: Command[];           // 命令插件
-  
-  // 配置
-  config?: PluginConfig;        // 插件配置
-  schema?: ConfigSchema;         // 配置 Schema
-  
-  // 生命周期
-  init?: (runtime: PluginRuntime) => Promise<void>;
-  start?: (runtime: PluginRuntime) => Promise<void>;
-  stop?: (runtime: PluginRuntime) => Promise<void>;
-};
-```
-
-### 插件注册表
-
-```typescript
-// registry.ts
-
-export type PluginRegistry = {
-  // 插件记录
-  plugins: PluginRecord[];
-  
-  // 工具注册
-  tools: PluginToolRegistration[];
-  
-  // 钩子注册
-  hooks: PluginHookRegistration[];
-  typedHooks: TypedPluginHookRegistration[];
-  
-  // 通道注册
-  channels: PluginChannelRegistration[];
-  
-  // 提供商注册
-  providers: PluginProviderRegistration[];
-  
-  // 网关处理器
-  gatewayHandlers: GatewayRequestHandlers;
-  
-  // HTTP 处理器
-  httpHandlers: PluginHttpRegistration[];
-  httpRoutes: PluginHttpRouteRegistration[];
-  
-  // CLI 注册
-  cliRegistrars: PluginCliRegistration[];
-  
-  // 服务注册
-  services: PluginServiceRegistration[];
-  
-  // 命令注册
-  commands: PluginCommandRegistration[];
-  
-  // 诊断
-  diagnostics: PluginDiagnostic[];
-};
-```
-
-### 插件生命周期
-
-```mermaid
-stateDiagram-v2
-    [*] --> Discovered: 发现插件
-    Discovered --> Loaded: 加载模块
-    Loaded --> Validated: 验证配置
-    Validated --> Registered: 注册到系统
-    Registered --> Initialized: 执行 init()
-    Initialized --> Started: 执行 start()
-    Started --> Running: 运行时状态
-    Running --> Stopped: 执行 stop()
-    Stopped --> Unloaded: 卸载插件
-    Unloaded --> [*]: 清理完成
-    
-    Running --> Error: 发生错误
-    Error --> Registered: 重试注册
-```
-
----
-
-## 插件发现与加载
-
-### 发现机制
-
-```typescript
-// discovery.ts
-
 const EXTENSION_EXTS = new Set([".ts", ".js", ".mts", ".cts", ".mjs", ".cjs"]);
 
-// 插件来源
 type PluginOrigin = "config" | "workspace" | "global" | "bundled";
 
-// 插件候选
 type PluginCandidate = {
   idHint: string;
   source: string;           // 文件路径
   rootDir: string;          // 根目录
-  origin: PluginOrigin;      // 来源
+  origin: PluginOrigin;     // 来源
   workspaceDir?: string;
   packageName?: string;
   packageVersion?: string;
   packageDescription?: string;
 };
-
-// 发现流程
-function discoverPlugins(): PluginDiscoveryResult {
-  const candidates: PluginCandidate[] = [];
-  
-  // 1. 从配置目录发现
-  discoverInDirectory({
-    dir: CONFIG_DIR,
-    origin: "config",
-    candidates,
-  });
-  
-  // 2. 从工作区发现
-  discoverInDirectory({
-    dir: WORKSPACE_PLUGINS_DIR,
-    origin: "workspace",
-    candidates,
-  });
-  
-  // 3. 从全局目录发现
-  discoverInDirectory({
-    dir: GLOBAL_PLUGINS_DIR,
-    origin: "global",
-    candidates,
-  });
-  
-  return { candidates, diagnostics: [] };
-}
-
-function discoverInDirectory(params: {
-  dir: string;
-  origin: PluginOrigin;
-  workspaceDir?: string;
-  candidates: PluginCandidate[];
-  diagnostics: PluginDiagnostic[];
-}) {
-  const entries = fs.readdirSync(params.dir, { withFileTypes: true });
-  
-  for (const entry of entries) {
-    if (entry.isFile() && isExtensionFile(entry.name)) {
-      // 添加插件候选
-      addCandidate({
-        candidates: params.candidates,
-        idHint: path.basename(entry.name, path.extname(entry.name)),
-        source: path.join(params.dir, entry.name),
-        rootDir: params.dir,
-        origin: params.origin,
-        workspaceDir: params.workspaceDir,
-      });
-    }
-  }
-}
 ```
 
-### 加载流程
+`discoverInDirectory()` 对每个目录执行以下扫描：
+
+1. **单文件插件** — 匹配 `.ts`/`.js`/`.mts`/`.cts`/`.mjs`/`.cjs` 扩展名的文件直接作为候选
+2. **包插件** — 检测目录中的 `package.json`，如果包含 `openclaw.extensions` 字段则识别为插件包
+
+### 安全检查：`isUnsafePluginCandidate()`
+
+在将候选加入列表前，系统会执行严格的安全校验：
+
+| 检查项 | 说明 |
+|--------|------|
+| **路径逃逸检测** | 检查插件路径是否通过 `..` 等方式逃逸出预期目录 |
+| **世界可写目录** | 检测插件是否位于任何用户都可写入的目录（如 `/tmp`） |
+| **文件所有权** | 验证插件文件的所有者是否为当前用户或 root |
+
+不通过安全检查的候选会被标记为 `unsafe` 并记录诊断信息，不会进入后续加载流程。
+
+### Discovery 缓存
+
+发现结果内置 **~1 秒 TTL 缓存**，避免在短时间内重复扫描文件系统，提升启动和重载性能。
+
+---
+
+## Manifest Registry
+
+### `manifest-registry.ts` 工作流程
+
+Manifest Registry 负责从每个插件候选中加载和校验元数据清单：
+
+1. **加载清单** — 从插件根目录读取 `openclaw.json` 文件
+2. **Schema 校验** — 验证 config schema 的合法性
+3. **字段校验** — 检查 `kind`、`channels`、`providers`、`skills` 等声明
+4. **生成记录** — 产出 `PluginManifestRecord`
 
 ```typescript
-// loader.ts
-
-export async function loadPlugins(options: PluginLoadOptions): Promise<PluginRegistry> {
-  // 1. 发现插件
-  const { candidates } = discoverPlugins();
-  
-  // 2. 过滤启用的插件
-  const enabled = candidates.filter(c => isPluginEnabled(c, options.config));
-  
-  // 3. 加载每个插件
-  const registry = createPluginRegistry();
-  
-  for (const candidate of enabled) {
-    try {
-      // 动态导入模块
-      const module = await importPluginModule(candidate.source);
-      
-      // 提取插件定义
-      const definition = extractPluginDefinition(module);
-      
-      // 验证配置
-      const validated = validatePluginConfig(definition.config);
-      
-      // 注册到注册表
-      registerPlugin(registry, candidate, definition, validated);
-      
-    } catch (err) {
-      // 记录错误但继续加载其他插件
-      registry.diagnostics.push({
-        level: "error",
-        message: `Failed to load ${candidate.idHint}: ${String(err)}`,
-        source: candidate.source,
-      });
-    }
-  }
-  
-  return registry;
-}
-
-async function importPluginModule(source: string): Promise<OpenClawPluginModule> {
-  // 使用 jiti 支持 TypeScript
-  const jiti = createJiti(import.meta.url);
-  return await jiti.import(source);
-}
+type PluginManifestRecord = {
+  id: string;                              // 插件唯一标识
+  source: string;                          // 插件文件路径
+  configSchema?: Record<string, unknown>;  // JSON Schema 配置定义
+  kind?: PluginKind;                       // 插件类型 (如 "memory")
+  channels?: string[];                     // 声明的通道列表
+  providers?: string[];                    // 声明的 Provider 列表
+  skills?: string[];                       // 声明的 Skill 列表
+};
 ```
 
-### 模块解析
+Manifest Registry 的作用是在**实际加载模块代码之前**就建立一份插件能力清单，用于启用状态判断、配置校验和加载优化。
+
+---
+
+## 加载管线 (loader.ts)
+
+加载管线是整个插件系统的核心编排流程，按严格的步骤顺序执行：
+
+```mermaid
+flowchart TD
+    A["1. normalizePluginsConfig()<br/>+ applyTestPluginDefaults()"] --> B["2. buildCacheKey()<br/>→ 检查 Registry 缓存"]
+    B --> C["3. clearPluginCommands()<br/>清理旧命令"]
+    C --> D["4. createPluginRegistry()<br/>+ createApi()"]
+    D --> E["5. discoverOpenClawPlugins()<br/>扫描所有来源"]
+    E --> F["6. loadPluginManifestRegistry()<br/>加载清单"]
+    F --> G{"7. 遍历每个候选插件"}
+    
+    G --> H["resolveEffectiveEnableState()<br/>判断启用/禁用"]
+    H --> I{"启用?"}
+    I -->|否| J["跳过，记录诊断"]
+    I -->|是| K["resolveMemorySlotDecision()<br/>内存槽位决策"]
+    K --> L["validatePluginConfig()<br/>JSON Schema 校验"]
+    L --> M{"校验通过?"}
+    M -->|否| N["记录错误，跳过"]
+    M -->|是| O["getJiti()(safeSource)<br/>Jiti 动态加载模块"]
+    O --> P["mod.register(api)<br/>执行插件注册函数"]
+    
+    P --> Q{"更多候选?"}
+    J --> Q
+    N --> Q
+    Q -->|是| G
+    Q -->|否| R["8. activatePluginRegistry()<br/>setActivePluginRegistry<br/>+ initializeGlobalHookRunner"]
+    
+    style A fill:#e1f5fe
+    style R fill:#c8e6c9
+    style H fill:#fff3e0
+    style O fill:#fce4ec
+```
+
+### 各步骤详解
+
+#### Step 1: 配置标准化
 
 ```typescript
-// loader.ts
-
-function resolvePluginModuleExport(moduleExport: unknown): {
-  definition?: OpenClawPluginDefinition;
-  register?: OpenClawPluginDefinition["register"];
-} {
-  // 支持多种导出方式
-  
-  // 1. 默认导出
-  if (moduleExport && typeof moduleExport === "object" && "default" in moduleExport) {
-    const def = moduleExport.default;
-    if (typeof def === "function") {
-      return { register: def };
-    }
-    if (def && typeof def === "object") {
-      return { definition: def as OpenClawPluginDefinition };
-    }
-  }
-  
-  // 2. 命名导出
-  if (moduleExport && typeof moduleExport === "object") {
-    const def = moduleExport as OpenClawPluginDefinition;
-    if (def.register || def.activate || def.id) {
-      return { definition: def };
-    }
-  }
-  
-  return {};
-}
+normalizePluginsConfig(config);
+applyTestPluginDefaults(config); // 测试环境下的默认值
 ```
+
+将原始配置转换为统一的内部格式，处理数组/对象/简写等多种配置写法。
+
+#### Step 2: 缓存检查
+
+```typescript
+const cacheKey = buildCacheKey(config, workspaceDir);
+// 如果缓存命中且未过期，直接返回缓存的 Registry
+```
+
+#### Step 3~4: 清理与初始化
+
+清除上一轮注册的命令，创建空白的 `PluginRegistry` 和面向插件的 `Api` 对象。
+
+#### Step 5~6: 发现与清单
+
+执行上文所述的发现扫描和 Manifest 加载。
+
+#### Step 7: 逐个加载
+
+对每个候选执行三道关卡：
+
+| 关卡 | 函数 | 作用 |
+|------|------|------|
+| 启用判断 | `resolveEffectiveEnableState()` | 综合配置、来源优先级、显式禁用等因素决定是否加载 |
+| 内存决策 | `resolveMemorySlotDecision()` | 对 `kind: "memory"` 类型插件进行槽位竞争决策 |
+| 配置校验 | `validatePluginConfig()` | 使用 AJV 进行 JSON Schema 校验 |
+
+通过所有关卡后，使用 Jiti 动态加载模块并调用 `mod.register(api)` 完成注册。
+
+#### Step 8: 激活
+
+```typescript
+setActivePluginRegistry(registry);
+initializeGlobalHookRunner(registry);
+```
+
+将 Registry 设置为全局活跃实例，初始化 Hook 执行器，插件系统正式就绪。
+
+---
+
+## Plugin Registry (registry.ts)
+
+### Registry 数据结构
+
+Plugin Registry 是所有已注册插件能力的中央仓库：
+
+```typescript
+type PluginRegistry = {
+  plugins: PluginRecord[];                    // 插件记录
+  tools: PluginToolRegistration[];            // 工具
+  hooks: PluginHookRegistration[];            // Hook
+  typedHooks: TypedPluginHookRegistration[];  // 类型化 Hook
+  channels: PluginChannelRegistration[];      // 通道
+  providers: PluginProviderRegistration[];    // Provider
+  gatewayHandlers: GatewayRequestHandlers;    // 网关方法
+  httpHandlers: PluginHttpRegistration[];     // HTTP 处理器（旧）
+  httpRoutes: PluginHttpRouteRegistration[];  // HTTP 路由（新）
+  cliRegistrars: PluginCliRegistration[];     // CLI 注册
+  services: PluginServiceRegistration[];      // 服务
+  commands: PluginCommandRegistration[];      // 命令
+  diagnostics: PluginDiagnostic[];            // 诊断信息
+};
+```
+
+### Plugin API
+
+`createApi(record, config)` 为每个插件创建隔离的注册 API，暴露以下方法：
+
+| API 方法 | 注册能力 |
+|----------|----------|
+| `registerTool(factory)` | 注册工具工厂函数 |
+| `registerHook(hookName, handler, priority?)` | 注册 Hook 处理器 |
+| `registerChannel(channelPlugin)` | 注册通道插件 |
+| `registerProvider(provider)` | 注册模型 Provider |
+| `registerGatewayMethod(name, handler)` | 注册网关方法 |
+| `registerHttpRoute(route)` | 注册 HTTP 路由 |
+| `registerService(service)` | 注册后台服务 |
+| `registerCommand(command)` | 注册 CLI 命令 |
+| `registerCli(registrar)` | 注册 CLI 扩展 |
+
+### 重复检测
+
+系统使用 `pluginId + source` 的组合进行重复检测。当检测到相同标识的插件从不同来源注册时，按来源优先级决定保留哪一个，并在诊断信息中记录冲突。
 
 ---
 
 ## 通道插件
 
-### 通道接口
+### ChannelPlugin 接口
+
+通道插件是 OpenClaw 最复杂的插件类型，定义了 **22 个适配器接口**，覆盖通信通道的全部能力：
 
 ```typescript
-// channels/plugins/types.plugin.ts
-
-export type ChannelPlugin<ResolvedAccount = any, Probe = unknown, Audit = unknown> = {
-  // 核心标识
+type ChannelPlugin<ResolvedAccount = any, Probe = unknown, Audit = unknown> = {
   id: ChannelId;
   meta: ChannelMeta;
-  
-  // 能力声明
   capabilities: ChannelCapabilities;
-  
-  // 配置
-  config: ChannelConfigAdapter<ResolvedAccount>;
-  configSchema?: ChannelConfigSchema;
-  
-  // 生命周期
-  setup?: ChannelSetupAdapter;
-  
-  // 功能适配器
-  auth?: ChannelAuthAdapter;
-  security?: ChannelSecurityAdapter;
-  outbound?: ChannelOutboundAdapter;
-  groups?: ChannelGroupAdapter;
-  mentions?: ChannelMentionAdapter;
-  messaging?: ChannelMessagingAdapter;
-  streaming?: ChannelStreamingAdapter;
-  threading?: ChannelThreadingAdapter;
-  directory?: ChannelDirectoryAdapter;
-  
-  // 特殊功能
-  commands?: ChannelCommandAdapter;
-  actions?: ChannelMessageActionAdapter;
-  agentPrompt?: ChannelAgentPromptAdapter;
-  agentTools?: ChannelAgentToolFactory;
-  
-  // 工具
-  heartbeat?: ChannelHeartbeatAdapter;
+
+  // 22 个适配器（均为可选）
+  config: ChannelConfigAdapter<ResolvedAccount>;  // 配置
+  gateway: ChannelGatewayAdapter;                 // 网关
+  outbound: ChannelOutboundAdapter;               // 出站消息
+  security: ChannelSecurityAdapter;               // 安全
+  groups: ChannelGroupAdapter;                    // 群组
+  mentions: ChannelMentionAdapter;                // @提及
+  setup: ChannelSetupAdapter;                     // 初始化设置
+  pairing: ChannelPairingAdapter;                 // 配对
+  auth: ChannelAuthAdapter;                       // 认证
+  elevated: ChannelElevatedAdapter;               // 提权
+  commands: ChannelCommandAdapter;                // 命令
+  streaming: ChannelStreamingAdapter;             // 流式传输
+  threading: ChannelThreadingAdapter;             // 线程/回复
+  messaging: ChannelMessagingAdapter;             // 消息收发
+  agentPrompt: ChannelAgentPromptAdapter;         // Agent 提示词
+  directory: ChannelDirectoryAdapter;             // 目录/联系人
+  resolver: ChannelResolverAdapter;               // 标识解析
+  actions: ChannelMessageActionAdapter;           // 消息操作
+  heartbeat: ChannelHeartbeatAdapter;             // 心跳
+  status: ChannelStatusAdapter;                   // 状态
+  agentTools: ChannelAgentToolFactory;            // Agent 工具
+  gatewayMethods: ChannelGatewayMethodAdapter;    // 网关方法
 };
 ```
 
-### 适配器模式
+### 通道生命周期
 
-```typescript
-// 通道适配器接口示例
-
-// 消息适配器
-type ChannelMessagingAdapter = {
-  // 发送消息
-  send: (params: {
-    channelId: string;
-    target: string;
-    message: ChannelMessage;
-    replyTo?: string;
-    threadId?: string;
-  }) => Promise<SendResult>;
-  
-  // 接收消息
-  onMessage: (handler: MessageHandler) => void;
-  
-  // 流式消息
-  stream?: (params: {
-    channelId: string;
-    target: string;
-  }) => AsyncIterable<ChannelMessage>;
-};
-
-// 认证适配器
-type ChannelAuthAdapter = {
-  // 开始认证流程
-  startAuth: (ctx: AuthContext) => Promise<AuthResult>;
-  
-  // 检查认证状态
-  checkStatus: (ctx: AuthContext) => Promise<AuthStatus>;
-  
-  // 撤销认证
-  revoke?: (ctx: AuthContext) => Promise<void>;
-};
+```mermaid
+stateDiagram-v2
+    [*] --> Registered: 注册到 ChannelManager
+    Registered --> Starting: channelManager.start()
+    Starting --> Running: 启动成功
+    Starting --> Error: 启动失败
+    
+    Running --> Stopping: 手动停止 / 系统关闭
+    Running --> Error: 运行时错误
+    
+    Error --> WaitBackoff: 自动重启策略
+    WaitBackoff --> Starting: 退避结束，重试
+    WaitBackoff --> Stopped: 达到最大重试次数
+    
+    Error --> Stopped: manuallyStopped=true
+    
+    Stopping --> Stopped: 清理完成
+    Stopped --> Starting: 手动重启
+    Stopped --> [*]: 卸载
+    
+    note right of WaitBackoff
+        退避策略：
+        初始: 5s
+        最大: 5min
+        因子: 2
+        抖动: 0.1
+        最大重试: 10 次
+    end note
 ```
 
-### 配置管理
+### 重启策略
 
-```typescript
-// 通道配置 Schema
+通道采用指数退避重启策略：
 
-export type ChannelConfigSchema = {
-  schema: Record<string, unknown>;
-  uiHints?: Record<string, {
-    label?: string;
-    help?: string;
-    advanced?: boolean;
-    sensitive?: boolean;
-    placeholder?: string;
-  }>;
-};
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| 初始退避 | 5 秒 | 首次重试等待时间 |
+| 最大退避 | 5 分钟 | 退避上限 |
+| 退避因子 | 2 | 每次失败后退避时间翻倍 |
+| 抖动系数 | 0.1 | 防止多通道同时重试（10% 随机偏移） |
+| 最大重试 | MAX_RESTART_ATTEMPTS = 10 | 超过后停止自动重启 |
 
-// 示例: WhatsApp 配置
-const whatsappConfigSchema: ChannelConfigSchema = {
-  schema: {
-    type: "object",
-    properties: {
-      sessionDir: { type: "string" },
-      phoneNumber: { type: "string" },
-      autoConnect: { type: "boolean" },
-      webhookUrl: { type: "string" },
-    },
-    required: ["sessionDir"],
-  },
-  uiHints: {
-    sessionDir: {
-      label: "会话目录",
-      help: "存储认证信息的目录路径",
-    },
-    phoneNumber: {
-      label: "手机号",
-      placeholder: "+8613888888888",
-    },
-    webhookUrl: {
-      label: "Webhook URL",
-      advanced: true,
-    },
-  },
-};
-```
+关键机制：当通道被用户**手动停止**时，`manuallyStopped` 标志为 `true`，此时即使发生错误也**不会触发自动重启**，避免与用户意图冲突。
 
 ---
 
-## 工具插件
+## Hook 系统
 
-### 工具工厂
+### Hook 事件类型
 
-```typescript
-// tools.ts
+Hook 覆盖了 OpenClaw 的全部生命周期阶段：
 
-export type OpenClawPluginToolFactory = (
-  ctx: OpenClawPluginToolContext,
-) => AnyAgentTool | AnyAgentTool[] | null | undefined;
+| 分类 | 事件 | 说明 |
+|------|------|------|
+| **网关** | `gateway:start` / `gateway:stop` | 网关启停 |
+| **会话** | `session:start` / `session:end` | 会话生命周期 |
+| **消息** | `message:received` / `message:sending` / `message:sent` | 消息收发链路 |
+| **Agent** | `agent:start` / `agent:end` / `agent:compaction` | Agent 生命周期 |
+| **工具** | `tool:before` / `tool:after` | 工具调用前后 |
 
-export type OpenClawPluginToolContext = {
-  config?: OpenClawConfig;
-  workspaceDir?: string;
-  agentDir?: string;
-  agentId?: string;
-  sessionKey?: string;
-  messageChannel?: string;
-  agentAccountId?: string;
-  sandboxed?: boolean;
-};
+### 两种执行模式
 
-// 工具定义
-export type AnyAgentTool = {
-  name: string;
-  description: string;
-  parameters: ToolParameters;
-  handler: ToolHandler;
-};
-
-// 工具注册
-export type PluginToolRegistration = {
-  pluginId: string;
-  factory: OpenClawPluginToolFactory;
-  names: string[];
-  optional: boolean;
-  source: string;
-};
-```
-
-### 上下文传递
+| 模式 | 执行方式 | 适用场景 |
+|------|----------|----------|
+| **Void Hook** | 并行执行（`Promise.all`） | 日志记录、通知、统计等无需修改数据的场景 |
+| **Modifying Hook** | 串行执行 + 结果合并 | 消息变换、权限检查等需要修改或拦截数据的场景 |
 
 ```typescript
-// 工具工厂示例
-function createCustomToolFactory(): OpenClawPluginToolFactory {
-  return (ctx: OpenClawPluginToolContext) => {
-    // 上下文包含所有必要信息
-    const { config, workspaceDir, agentId, sessionKey, sandboxed } = ctx;
-    
-    return {
-      name: "custom_tool",
-      description: "A custom tool provided by plugin",
-      parameters: {
-        type: "object",
-        properties: {
-          input: { type: "string" },
-        },
-        required: ["input"],
-      },
-      handler: async (args, context) => {
-        // 使用上下文执行工具
-        const result = await executeCustomLogic(args, {
-          workspaceDir,
-          agentId,
-          sessionKey,
-          sandboxed,
-        });
-        return result;
-      },
-    };
-  };
+// Void Hook — 并行执行，互不影响
+async function runVoidHook(hookName, event, ctx) {
+  const hooks = getHooksForName(hookName);
+  await Promise.all(hooks.map(h => h.handler(event, ctx).catch(err => {
+    logger.error(`Hook ${hookName} from ${h.pluginId} failed: ${err}`);
+  })));
 }
-```
 
----
-
-## 钩子系统
-
-### 钩子类型
-
-```typescript
-// hooks/types.ts
-
-// 钩子事件类型
-type PluginHookName =
-  // 网关生命周期
-  | "gateway:start"
-  | "gateway:stop"
-  
-  // 会话生命周期
-  | "session:start"
-  | "session:end"
-  
-  // 消息生命周期
-  | "message:received"
-  | "message:sending"
-  | "message:sent"
-  
-  // Agent 生命周期
-  | "agent:start"
-  | "agent:end"
-  | "agent:compaction"
-  
-  // 工具调用
-  | "tool:before"
-  | "tool:after";
-
-// 钩子定义
-type HookEntry = {
-  name: string;
-  events: PluginHookName[];
-  handler: HookHandler;
-  priority?: number;  // 优先级 (越高越先执行)
-  pluginId?: string;
-};
-
-// 钩子上下文
-type HookContext = {
-  sessionKey?: string;
-  agentId?: string;
-  messageId?: string;
-  timestamp: number;
-};
-```
-
-### 执行机制
-
-```typescript
-// hooks/runner.ts
-
-export function createHookRunner(registry: PluginRegistry) {
-  // 按优先级排序
-  function getHooksForName<K extends PluginHookName>(
-    hookName: K,
-  ): PluginHookRegistration<K>[] {
-    return registry.typedHooks
-      .filter((h) => h.hookName === hookName)
-      .toSorted((a, b) => (b.priority ?? 0) - (a.priority ?? 0));
-  }
-  
-  // 执行 void 钩子 (并行)
-  async function runVoidHook<K extends PluginHookName>(
-    hookName: K,
-    event: Parameters<HookHandler>[0],
-    ctx: Parameters<HookHandler>[1],
-  ): Promise<void> {
-    const hooks = getHooksForName(hookName);
-    if (hooks.length === 0) return;
-    
-    // 并行执行所有处理器
-    const promises = hooks.map(async (hook) => {
-      try {
-        await hook.handler(event, ctx);
-      } catch (err) {
-        // 错误不中断其他钩子
-        console.error(`Hook ${hookName} failed: ${err}`);
-      }
-    });
-    
-    await Promise.all(promises);
-  }
-  
-  // 执行 modifying 钩子 (串行，结果合并)
-  async function runModifyingHook<K extends PluginHookName, TResult>(
-    hookName: K,
-    event: Parameters<HookHandler>[0],
-    ctx: Parameters<HookHandler>[1],
-    mergeResults?: (acc: TResult, next: TResult) => TResult,
-  ): Promise<TResult | undefined> {
-    const hooks = getHooksForName(hookName);
-    let result: TResult | undefined;
-    
-    // 串行执行，结果合并
-    for (const hook of hooks) {
-      const hookResult = await hook.handler(event, ctx);
-      if (hookResult !== undefined) {
-        result = result !== undefined && mergeResults
-          ? mergeResults(result, hookResult)
-          : hookResult;
-      }
+// Modifying Hook — 串行执行，前一个的结果传给下一个
+async function runModifyingHook(hookName, event, ctx, mergeResults?) {
+  const hooks = getHooksForName(hookName);
+  let result = undefined;
+  for (const hook of hooks) {
+    const hookResult = await hook.handler(event, ctx);
+    if (hookResult !== undefined) {
+      result = result !== undefined && mergeResults
+        ? mergeResults(result, hookResult)
+        : hookResult;
     }
-    
-    return result;
   }
-  
-  return { runVoidHook, runModifyingHook };
+  return result;
 }
 ```
 
-### 优先级排序
+### 优先级与覆盖
 
-```mermaid
-flowchart LR
-    A[钩子注册] --> B{优先级定义?}
-    B -->|有| C[按 priority 排序]
-    B -->|无| D[默认 0]
-    
-    C --> E[降序排列]
-    D --> E
-    
-    E --> F[执行顺序]
-    F --> G[高优先级先执行]
-    F --> H[同优先级按注册顺序]
-    
-    I[示例: 优先级] --> J["hookA (priority: 100)"]
-    I --> K["hookB (priority: 50)"]
-    I --> L["hookC (无)"]
-    
-    J --> M[第 1 执行]
-    K --> N[第 2 执行]
-    L --> O[第 3 执行]
+**优先级排序规则**：`priority` 值越高越先执行，相同优先级按注册顺序。
+
+**来源覆盖规则**（低到高）：
+
+```
+extra（外部附加） < bundled（内置） < managed（托管） < workspace（工作区）
+```
+
+workspace 来源的 Hook 优先级最高，可以覆盖内置行为。
+
+### 事件分发：`triggerInternalHook(event)`
+
+Hook 执行器支持两级事件匹配：
+
+1. **精确匹配** — `event.type` (如 `message:received`)
+2. **动作匹配** — `event.type:action` (如 `message:received:transform`)
+
+这允许插件既可以监听某类事件的全部触发，也可以精确监听特定动作。
+
+---
+
+## 插件运行时
+
+### 依赖注入
+
+每个插件在注册时获得一个隔离的 Runtime 实例，包含以下注入服务：
+
+```typescript
+type PluginRuntime = {
+  config: PluginConfigAccess;   // 配置读写
+  logger: PluginLogger;         // 日志（debug/info/warn/error）
+  storage: PluginStorage;       // KV 存储
+  services: ServiceRegistry;    // 服务注册与获取
+  events: EventEmitter;         // 事件总线
+  tools: ToolRegistry;          // 工具注册表
+  http: HttpClient;             // HTTP 客户端
+};
+```
+
+### 网关请求作用域
+
+通过 `AsyncLocalStorage` 实现请求级别的上下文传递：
+
+```typescript
+// 为 WebSocket 连接创建请求作用域
+withPluginRuntimeGatewayRequestScope(requestContext, async () => {
+  // 在此闭包内，所有插件代码都能访问当前请求上下文
+  await processMessage(message);
+});
+```
+
+### 非 WebSocket 路径的上下文
+
+对于不走 WebSocket 的路径（如 Telegram Webhook、HTTP API 回调等），系统提供 `setFallbackGatewayContext()` 方法：
+
+```typescript
+setFallbackGatewayContext({
+  channelId: "telegram",
+  accountId: webhookAccountId,
+  // ...
+});
+```
+
+这确保了即使在 Webhook 回调等非标准路径下，插件也能正确访问网关上下文。
+
+---
+
+## 插件 HTTP 路由
+
+### 路由匹配
+
+HTTP 请求进入网关后的处理流程：
+
+1. `createGatewayPluginRequestHandler` 创建统一的请求处理器
+2. 请求到达时调用 `findMatchingPluginHttpRoutes` 匹配已注册路由
+3. 根据路由的认证模式执行鉴权
+4. 分发给对应插件的处理函数
+
+### 认证模式
+
+| 模式 | 值 | 说明 |
+|------|-----|------|
+| **网关认证** | `"gateway"` | 要求请求通过网关层面的认证（API Key / Token），适用于内部 API |
+| **插件自管** | `"plugin"` | 由插件自行管理认证逻辑，适用于第三方 Webhook 回调等场景 |
+
+```typescript
+type PluginHttpRoute = {
+  method: "GET" | "POST" | "PUT" | "DELETE" | "PATCH";
+  path: string;
+  auth: "gateway" | "plugin";  // 认证模式
+  handler: (req: Request, res: Response) => Promise<void>;
+};
 ```
 
 ---
 
-## 运行时集成
+## 插件服务生命周期
 
-### PluginRuntime
+插件可以注册长生命周期的后台服务（如定时任务、连接池管理等），系统保证服务的有序启停：
 
-```typescript
-// runtime/types.ts
+### 启动顺序
 
-export type PluginRuntime = {
-  // 配置访问
-  config: {
-    get<T = unknown>(key: string): T | undefined;
-    set<T>(key: string, value: T): void;
-    has(key: string): boolean;
-  };
-  
-  // 日志
-  logger: PluginLogger;
-  
-  // 存储
-  storage: {
-    get<T>(key: string): T | undefined;
-    set<T>(key: string, value: T): void;
-    delete(key: string): void;
-    clear(): void;
-  };
-  
-  // 服务
-  services: {
-    get<T>(name: string): T | undefined;
-    register<T>(name: string, service: T): void;
-  };
-  
-  // 生命周期
-  events: EventEmitter;
-  
-  // 工具
-  tools: ToolRegistry;
-  
-  // HTTP
-  http: {
-    get(url: string, options?: RequestInit): Promise<Response>;
-    post(url: string, body: unknown): Promise<Response>;
-  };
-};
-```
-
-### 服务注入
+按**注册顺序正序**启动，确保先注册的基础服务先就绪：
 
 ```typescript
-// runtime/index.ts
-
-export function createPluginRuntime(params: {
-  config: OpenClawConfig;
-  logger: PluginLogger;
-  workspaceDir: string;
-}): PluginRuntime {
-  const storage = createPluginStorage();
-  const eventEmitter = new EventEmitter();
-  
-  return {
-    // 配置服务
-    config: createConfigAdapter(params.config),
-    
-    // 日志服务
-    logger: {
-      debug: (msg) => params.logger.debug(msg),
-      info: (msg) => params.logger.info(msg),
-      warn: (msg) => params.logger.warn(msg),
-      error: (msg) => params.logger.error(msg),
-    },
-    
-    // 存储服务
-    storage: {
-      get: (key) => storage.get(key),
-      set: (key, value) => storage.set(key, value),
-      delete: (key) => storage.delete(key),
-      clear: () => storage.clear(),
-    },
-    
-    // 事件服务
-    events: eventEmitter,
-    
-    // HTTP 服务
-    http: {
-      async get(url, options) {
-        return await fetch(url, { ...options, method: "GET" });
-      },
-      async post(url, body) {
-        return await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        });
-      },
-    },
-  };
+for (const service of registry.services) {
+  await service.start(serviceContext);
 }
 ```
 
-### 依赖管理
+### 停止顺序
 
-```mermaid
-flowchart TB
-    subgraph "插件依赖"
-        A[Plugin A] -->|需要| B[Service X]
-        A -->|需要| C[Service Y]
-        D[Plugin B] -->|需要| B
-        D -->|需要| C
-    end
-    
-    subgraph "运行时"
-        E[PluginRuntime]
-        E -->|提供| X[Service X]
-        E -->|提供| Y[Service Y]
-        E -->|提供| Z[Service Z]
-    end
-    
-    X -->|注入到| A
-    Y -->|注入到| A
-    X -->|注入到| D
-    Y -->|注入到| D
+按**注册顺序逆序**停止，确保依赖于基础服务的上层服务先关闭：
+
+```typescript
+for (const service of [...registry.services].reverse()) {
+  await service.stop();
+}
 ```
+
+这种正序启动、逆序停止的模式是经典的栈式生命周期管理，避免了服务关闭时的依赖残留问题。
 
 ---
 
 ## 配置与状态
 
-### 配置模式
+### 配置标准化
+
+`normalizePluginsConfig()` 将多种配置格式统一为内部表示：
 
 ```typescript
-// config-state.ts
-
-// 配置标准化
-export function normalizePluginsConfig(config: OpenClawConfig): NormalizedPluginsConfig {
+function normalizePluginsConfig(config) {
   return {
     enabled: config.plugins?.enabled ?? true,
     plugins: normalizePluginList(config.plugins?.plugins),
     hooks: normalizeHookList(config.plugins?.hooks),
   };
 }
+```
 
-function normalizePluginList(plugins?: PluginConfigList): Record<string, PluginConfigEntry> {
-  const result: Record<string, PluginConfigEntry> = {};
-  
-  if (Array.isArray(plugins)) {
-    for (const entry of plugins) {
-      if (entry?.id) {
-        result[entry.id] = {
-          id: entry.id,
-          enabled: entry.enabled ?? true,
-          config: entry.config ?? {},
-        };
-      }
-    }
-  }
-  
-  return result;
-}
+### JSON Schema 校验
 
-// 配置验证
-export function validatePluginConfig(params: {
-  schema?: Record<string, unknown>;
+使用 AJV 对插件配置进行严格校验：
+
+```typescript
+function validateJsonSchemaValue(params: {
+  schema: Record<string, unknown>;
+  cacheKey?: string;
   value?: unknown;
-}): { ok: boolean; value?: Record<string, unknown>; errors?: string[] } {
-  if (!params.schema) {
-    return { ok: true, value: params.value as Record<string, unknown> };
-  }
+}): { ok: boolean; errors?: string[] } {
+  const ajv = new Ajv({ allErrors: true });
+  const validate = ajv.compile(params.schema);
+  const valid = validate(params.value);
   
-  // 使用 JSON Schema 验证
-  const errors = validateJsonSchema(params.schema, params.value);
-  if (errors.length > 0) {
-    return { ok: false, errors };
-  }
+  if (valid) return { ok: true };
   
-  return { ok: true, value: params.value as Record<string, unknown> };
+  const errors = validate.errors?.map(err => {
+    const path = err.instancePath || "root";
+    return `${path}: ${err.message}`;
+  }) ?? ["Unknown error"];
+  
+  return { ok: false, errors };
 }
 ```
 
-### 状态管理
+### 插件记录（PluginRecord）
+
+每个成功注册的插件都会生成一份完整的能力清单：
 
 ```typescript
-// config-state.ts
-
-export type PluginRecord = {
+type PluginRecord = {
   id: string;
   name: string;
   version?: string;
@@ -959,12 +603,11 @@ export type PluginRecord = {
   origin: PluginOrigin;
   workspaceDir?: string;
   
-  // 状态
   enabled: boolean;
   status: "loaded" | "disabled" | "error";
   error?: string;
   
-  // 功能清单
+  // 完整能力清单
   toolNames: string[];
   hookNames: string[];
   channelIds: string[];
@@ -976,495 +619,84 @@ export type PluginRecord = {
   httpHandlers: number;
   hookCount: number;
   
-  // 配置
   configSchema: boolean;
   configUiHints?: Record<string, PluginConfigUiHint>;
   configJsonSchema?: Record<string, unknown>;
 };
-
-// 创建插件记录
-export function createPluginRecord(params: {
-  id: string;
-  name?: string;
-  description?: string;
-  version?: string;
-  source: string;
-  origin: PluginOrigin;
-  enabled: boolean;
-  configSchema: boolean;
-}): PluginRecord {
-  return {
-    id: params.id,
-    name: params.name ?? params.id,
-    description: params.description,
-    version: params.version,
-    source: params.source,
-    origin: params.origin,
-    enabled: params.enabled,
-    status: params.enabled ? "loaded" : "disabled",
-    toolNames: [],
-    hookNames: [],
-    channelIds: [],
-    providerIds: [],
-    gatewayMethods: [],
-    cliCommands: [],
-    services: [],
-    commands: [],
-    httpHandlers: 0,
-    hookCount: 0,
-    configSchema: params.configSchema,
-  };
-}
-```
-
----
-
-## 使用指南
-
-### 创建插件
-
-#### 1. 定义插件
-
-```typescript
-// my-plugin.ts
-import type { OpenClawPluginDefinition, PluginRuntime } from "@openclaw/plugin-sdk";
-
-export default {
-  id: "my-plugin",
-  name: "我的插件",
-  version: "1.0.0",
-  description: "这是一个示例插件",
-  
-  // 注册工具
-  tools: [
-    {
-      name: "my_tool",
-      description: "我的自定义工具",
-      parameters: {
-        type: "object",
-        properties: {
-          input: { type: "string" },
-        },
-        required: ["input"],
-      },
-      handler: async (args, ctx) => {
-        return { result: `处理: ${args.input}` };
-      },
-    },
-  ],
-  
-  // 注册钩子
-  hooks: [
-    {
-      name: "消息处理钩子",
-      events: ["message:received"],
-      handler: async (event, ctx) => {
-        console.log(`收到消息: ${event.message}`);
-      },
-      priority: 100,
-    },
-  ],
-  
-  // 初始化
-  async init(runtime: PluginRuntime) {
-    console.log("插件初始化");
-  },
-  
-  // 启动
-  async start(runtime: PluginRuntime) {
-    console.log("插件启动");
-  },
-  
-  // 停止
-  async stop(runtime: PluginRuntime) {
-    console.log("插件停止");
-  },
-} satisfies OpenClawPluginDefinition;
-```
-
-#### 2. 配置文件
-
-```json
-{
-  "plugins": {
-    "enabled": true,
-    "plugins": [
-      {
-        "id": "my-plugin",
-        "enabled": true,
-        "config": {
-          "option1": "value1",
-          "option2": 123
-        }
-      }
-    ]
-  }
-}
-```
-
-### 注册插件
-
-```typescript
-// 在 openclaw.config.ts 中注册
-export default {
-  plugins: {
-    enabled: true,
-    plugins: [
-      {
-        id: "my-plugin",
-        enabled: true,
-        config: {
-          // 插件配置
-        }
-      }
-    ],
-    hooks: [
-      {
-        id: "my-hook",
-        enabled: true,
-        events: ["session:start"]
-      }
-    ]
-  }
-};
-```
-
-### 插件开发最佳实践
-
-```typescript
-// 1. 错误处理
-async function myToolHandler(args: ToolArgs, ctx: ToolContext): Promise<ToolResult> {
-  try {
-    // 执行逻辑
-    return { success: true, result: "..." };
-  } catch (err) {
-    // 返回结构化错误
-    return {
-      success: false,
-      error: err instanceof Error ? err.message : "Unknown error"
-    };
-  }
-}
-
-// 2. 使用日志
-function createTool(runtime: PluginRuntime) {
-  const logger = runtime.logger;
-  
-  return {
-    name: "my_tool",
-    handler: async (args, ctx) => {
-      logger.info(`Tool called with ${JSON.stringify(args)}`);
-      // ...
-    },
-  };
-}
-
-// 3. 状态持久化
-function createPlugin(runtime: PluginRuntime) {
-  const storage = runtime.storage;
-  
-  return {
-    name: "stateful-plugin",
-    async init() {
-      // 恢复状态
-      const state = storage.get<PluginState>("state");
-      if (state) {
-        this.state = state;
-      }
-    },
-    async handleEvent(event) {
-      // 更新状态
-      this.state.lastEvent = event;
-      // 持久化
-      storage.set("state", this.state);
-    },
-  };
-}
-```
-
----
-
-## 源码关键代码解读
-
-### 1. 插件注册表创建
-
-```typescript
-// registry.ts
-
-export function createPluginRegistry(params: PluginRegistryParams): PluginRegistry {
-  const registry: PluginRegistry = {
-    plugins: [],
-    tools: [],
-    hooks: [],
-    typedHooks: [],
-    channels: [],
-    providers: [],
-    gatewayHandlers: {},
-    httpHandlers: [],
-    httpRoutes: [],
-    cliRegistrars: [],
-    services: [],
-    commands: [],
-    diagnostics: [],
-  };
-  
-  return registry;
-}
-```
-
-### 2. 插件注册
-
-```typescript
-// registry.ts
-
-export function registerPlugin(
-  registry: PluginRegistry,
-  candidate: PluginCandidate,
-  definition: OpenClawPluginDefinition,
-  validatedConfig: Record<string, unknown>,
-): PluginRecord {
-  // 创建插件记录
-  const record = createPluginRecord({
-    id: candidate.idHint,
-    name: definition.name,
-    version: definition.version,
-    description: definition.description,
-    source: candidate.source,
-    origin: candidate.origin,
-    enabled: true,
-    configSchema: !!definition.schema,
-  });
-  
-  // 注册工具
-  if (definition.tools) {
-    for (const tool of definition.tools) {
-      const factory = createToolFactory(tool);
-      registry.tools.push({
-        pluginId: record.id,
-        factory,
-        names: [tool.name],
-        optional: false,
-        source: candidate.source,
-      });
-      record.toolNames.push(tool.name);
-    }
-  }
-  
-  // 注册钩子
-  if (definition.hooks) {
-    for (const hook of definition.hooks) {
-      registry.hooks.push({
-        pluginId: record.id,
-        entry: hook,
-        events: hook.events,
-        source: candidate.source,
-      });
-      record.hookNames.push(...hook.events);
-      record.hookCount += hook.events.length;
-    }
-  }
-  
-  // 添加到注册表
-  registry.plugins.push(record);
-  
-  return record;
-}
-```
-
-### 3. 钩子执行器
-
-```typescript
-// hooks/runner.ts
-
-export function createHookRunner(registry: PluginRegistry) {
-  // 按名称和优先级获取钩子
-  function getHooksForName<K extends PluginHookName>(hookName: K) {
-    return registry.typedHooks
-      .filter((h) => h.hookName === hookName)
-      .toSorted((a, b) => (b.priority ?? 0) - (a.priority ?? 0));
-  }
-  
-  // 并行执行 void 钩子
-  async function runVoidHook<K extends PluginHookName>(
-    hookName: K,
-    event: Parameters<HookHandler>[0],
-    ctx: Parameters<HookHandler>[1],
-  ): Promise<void> {
-    const hooks = getHooksForName(hookName);
-    
-    const promises = hooks.map(async (hook) => {
-      try {
-        await hook.handler(event, ctx);
-      } catch (err) {
-        console.error(`Hook ${hookName} from ${hook.pluginId} failed: ${err}`);
-      }
-    });
-    
-    await Promise.all(promises);
-  }
-  
-  return { runVoidHook };
-}
-```
-
-### 4. 配置验证
-
-```typescript
-// schema-validator.ts
-
-export function validateJsonSchemaValue(params: {
-  schema: Record<string, unknown>;
-  cacheKey?: string;
-  value?: unknown;
-}): { ok: boolean; errors?: string[] } {
-  // 使用 AJV 进行 JSON Schema 验证
-  const ajv = new Ajv({ allErrors: true });
-  const validate = ajv.compile(params.schema);
-  const valid = validate(params.value);
-  
-  if (valid) {
-    return { ok: true };
-  }
-  
-  const errors = validate.errors?.map((err) => {
-    const path = err.instancePath || "root";
-    return `${path}: ${err.message}`;
-  }) ?? ["Unknown error"];
-  
-  return { ok: false, errors };
-}
 ```
 
 ---
 
 ## 常见问题
 
-### Q1: 如何调试插件？
+### Q1: 插件加载失败，如何排查？
 
-```typescript
-// 启用调试日志
-runtime.logger.debug("Debug message");
-runtime.logger.info("Info message");
-runtime.logger.warn("Warning");
-runtime.logger.error("Error");
+**排查步骤**：
 
-// 查看注册表状态
-console.log(registry.plugins);
-console.log(registry.tools);
-console.log(registry.hooks);
-```
-
-### Q2: 插件加载失败怎么办？
-
-1. 检查插件 ID 是否正确
-2. 验证配置文件语法
-3. 查看错误日志：`openclaw logs | grep -i plugin`
-4. 尝试手动禁用/启用插件
+1. 检查 `diagnostics` 诊断信息 — 加载管线会将每一步的错误记录到 `registry.diagnostics`
+2. 确认插件文件路径和扩展名是否在支持列表中（`.ts`/`.js`/`.mts`/`.cts`/`.mjs`/`.cjs`）
+3. 检查安全校验 — 通过日志搜索 `unsafe` 关键字，确认是否被安全检查拦截
+4. 验证 `openclaw.json` 清单文件格式是否正确
+5. 检查配置 Schema 校验错误 — AJV 会返回详细的字段级错误信息
 
 ```bash
-# 查看插件状态
-openclaw plugins list
-
-# 禁用插件
-openclaw plugins disable my-plugin
-
-# 启用插件
-openclaw plugins enable my-plugin
+openclaw plugins list          # 查看插件状态
+openclaw logs | grep plugin    # 搜索插件相关日志
 ```
 
-### Q3: 如何传递数据给工具？
+### Q2: 如何控制插件的启用/禁用？
 
-```typescript
-// 使用上下文
-function createTool(runtime: PluginRuntime) {
-  const config = runtime.config.get<MyConfig>("my-plugin");
-  
-  return {
-    name: "my_tool",
-    handler: async (args, ctx) => {
-      // 通过上下文访问配置
-      const apiKey = config?.apiKey;
-      // ...
-    },
-  };
-}
+插件启用状态由 `resolveEffectiveEnableState()` 综合决定，优先级如下：
 
-// 使用存储
-runtime.storage.set("key", value);
-const value = runtime.storage.get("key");
-```
+1. **用户配置中的显式设置**（最高优先级）
+2. **来源优先级**（workspace > global > bundled）
+3. **默认值**（未配置时默认启用）
 
-### Q4: 钩子之间如何通信？
-
-```typescript
-// 使用事件系统
-runtime.events.emit("my:event", data);
-
-// 监听事件
-runtime.events.on("my:event", (data) => {
-  console.log("Received:", data);
-});
-
-// 使用存储共享状态
-pluginA.runtime.storage.set("shared", data);
-pluginB.runtime.storage.get("shared");
-```
-
-### Q5: 如何创建 HTTP 端点？
-
-```typescript
-// 在插件中定义 HTTP 处理器
-export default {
-  id: "http-plugin",
-  
-  http: {
-    handlers: [
-      {
-        method: "GET",
-        path: "/my-plugin/status",
-        handler: async (req, res) => {
-          return { status: "ok" };
-        },
-      },
-    ],
-  },
-};
-```
-
-### Q6: 插件如何访问 Agent 上下文？
-
-```typescript
-function createTool(runtime: PluginRuntime) {
-  return {
-    name: "context_tool",
-    handler: async (args, ctx) => {
-      // 通过上下文访问
-      const agentId = ctx.agentId;
-      const sessionKey = ctx.sessionKey;
-      const workspaceDir = runtime.config.get("workspaceDir");
-      
-      return {
-        agentId,
-        sessionKey,
-        workspaceDir,
-      };
-    },
-  };
+```json
+{
+  "plugins": {
+    "plugins": [
+      { "id": "my-plugin", "enabled": false }
+    ]
+  }
 }
 ```
+
+### Q3: 多个 Hook 的执行顺序是怎样的？
+
+- **Void Hook**：所有处理器并行执行，互不阻塞，单个失败不影响其他
+- **Modifying Hook**：按 `priority` 降序串行执行，前一个结果传给下一个
+- **来源覆盖**：workspace 的 Hook 覆盖 bundled 的同名 Hook
+
+### Q4: 通道崩溃后的重启行为？
+
+系统自动执行指数退避重启（5s → 10s → 20s → ... → 5min），最多 10 次。如果是用户手动停止的通道（`manuallyStopped=true`），则不会自动重启。
+
+### Q5: 如何注册自定义 HTTP 端点？
+
+```typescript
+export function register(api) {
+  api.registerHttpRoute({
+    method: "POST",
+    path: "/my-plugin/webhook",
+    auth: "plugin",  // 插件自行管理认证
+    handler: async (req, res) => {
+      const body = await req.json();
+      // 处理 webhook 回调
+      res.json({ ok: true });
+    },
+  });
+}
+```
+
+### Q6: Webhook 等非 WebSocket 路径如何获取网关上下文？
+
+使用 `setFallbackGatewayContext()` 为当前请求设置上下文，确保插件代码能正常访问 channel、account 等信息。这对 Telegram Webhook、Slack Events API 等场景特别重要。
+
+### Q7: 插件服务的启停顺序有保证吗？
+
+有保证。启动按注册顺序正序执行，停止按注册顺序逆序执行，遵循栈式生命周期模型。基础服务先启动后停止，上层服务后启动先停止。
 
 ---
 
-## 总结
-
-OpenClaw 插件系统核心要点：
-
-1. **多类型支持** - 通道、工具、钩子、命令、HTTP
-2. **动态发现** - 支持本地、npm、git 多种来源
-3. **懒加载** - 按需导入，最小化启动开销
-4. **依赖注入** - 通过 Runtime 提供标准化服务
-5. **钩子系统** - 支持优先级排序和结果合并
-6. **配置验证** - JSON Schema + UI Hints
-7. **沙箱隔离** - 可选的安全执行环境
-
-掌握这些概念，就能开发功能强大的 OpenClaw 插件！
+*基于 OpenClaw v2026.2.3-1 源码分析*
