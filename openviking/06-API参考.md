@@ -1,6 +1,6 @@
 # OpenViking API 参考
 
-> 完整的 API 接口文档
+> 完整的 API 接口文档（与 `openviking/sync_client.py`、`openviking/async_client.py`、`openviking_cli/client/` 源码一一对应）
 
 ## 目录
 
@@ -10,30 +10,55 @@
 4. [搜索功能](#4-搜索功能)
 5. [会话管理](#5-会话管理)
 6. [关联管理](#6-关联管理)
+7. [导入导出](#7-导入导出)
+8. [数据类型](#8-数据类型)
 
 ---
 
 ## 1. 客户端初始化
 
-### 1.1 嵌入式客户端
+### 1.1 顶层包导出
+
+`openviking/__init__.py` 仅惰性导出以下名称：
+
+```python
+__all__ = [
+    "OpenViking",        # = SyncOpenViking 别名
+    "SyncOpenViking",
+    "AsyncOpenViking",
+    "SyncHTTPClient",
+    "AsyncHTTPClient",
+    "Session",
+    "UserIdentifier",
+]
+```
+
+> ⚠️ `TextPart` / `ContextPart` / `ToolPart` / `ContextType` / `SearchMode` **都不在顶层包**——前三个需要 `from openviking.message import ...`；`ContextType` 需要 `from openviking_cli.retrieve.types import ContextType`；`SearchMode` **完全不存在**。
+
+### 1.2 嵌入式客户端
 
 ```python
 import openviking as ov
 
-# 同步客户端
-client = ov.SyncOpenViking(path="./data")
+# 同步客户端（OpenViking 即 SyncOpenViking）
+client = ov.OpenViking(path="./data")
 client.initialize()
 # ... 使用 ...
 client.close()
 
 # 异步客户端
-client = ov.OpenViking(path="./data")
-await client.initialize()
-# ... 使用 ...
-await client.close()
+import asyncio
+async def main():
+    client = ov.AsyncOpenViking(path="./data")
+    await client.initialize()
+    # ... 使用 ...
+    await client.close()
+asyncio.run(main())
 ```
 
-### 1.2 HTTP 客户端
+> `AsyncOpenViking` 是单例（`__new__` 锁），重复构造返回同一实例；`reset()` 类方法用于测试场景。
+
+### 1.3 HTTP 客户端
 
 ```python
 import openviking as ov
@@ -41,15 +66,18 @@ import openviking as ov
 # 同步 HTTP 客户端
 client = ov.SyncHTTPClient(
     url="http://localhost:1933",
-    api_key="your-api-key"
+    api_key="your-api-key",   # 服务端配置 root_api_key 时必填
 )
+client.initialize()
 
 # 异步 HTTP 客户端
-client = ov.HTTPClient(
+client = ov.AsyncHTTPClient(
     url="http://localhost:1933",
-    api_key="your-api-key"
+    api_key="your-api-key",
 )
 ```
+
+> `SyncHTTPClient`/`AsyncHTTPClient` 都支持自动从 `~/.openviking/ovcli.conf` 加载 `url`/`api_key`，参见 `openviking_cli/client/sync_http.py` 文档字符串。
 
 ---
 
@@ -57,58 +85,47 @@ client = ov.HTTPClient(
 
 ### 2.1 add_resource
 
-添加资源（文件、目录、URL）。
+添加资源（仅作用于 `viking://resources/` scope）。
 
 ```python
-# 添加本地文件/目录
 result = client.add_resource(
-    path="./docs",           # 本地路径
-    reason="API 文档"         # 原因说明
+    path="./docs",                      # 本地路径 / URL / GitHub 仓库
+    to=None,                            # 显式指定目标 URI（不可与 parent 同时使用）
+    parent=None,                        # 指定父 URI
+    reason="API 文档",                   # 原因说明
+    instruction="",                     # 处理指令
+    wait=False,                         # 是否阻塞等待处理完成
+    timeout=None,
+    build_index=True,                   # 是否立即建立向量索引
+    summarize=False,                    # 是否生成 L0/L1 摘要
 )
 
-# 添加 URL
-result = client.add_resource(
-    path="https://example.com/docs.pdf"
-)
-
-# 添加 GitHub 仓库
-result = client.add_resource(
-    path="https://github.com/user/repo"
-)
-
-# 返回值
-{
-    "root_uri": "viking://resources/docs/",
-    "file_count": 10,
-    "status": "processing"
-}
+# 返回 dict，含 'root_uri' 和其他元数据
+print(result["root_uri"])     # "viking://resources/docs/"
+print(result.get("queue_status"))  # 仅 wait=True 时返回
 ```
+
+> 同时指定 `to` 与 `parent` 会抛 `ValueError`。
 
 ### 2.2 add_skill
 
-添加技能定义。
+添加 Claude Skills 协议格式的技能。
 
 ```python
-result = client.add_skill({
-    "name": "search-code",
-    "description": "代码搜索技能",
-    "content": "# search-code\n...",
-    "scripts": {
-        "search": "python scripts/search.py"
-    }
-})
+result = client.add_skill(
+    data={...},        # Skills 协议字典或文件路径
+    wait=False,
+    timeout=None,
+)
 ```
 
 ### 2.3 wait_processed
 
-等待异步处理完成。
+等待全部异步语义处理完成。
 
 ```python
-# 等待所有资源处理完成
-client.wait_processed()
-
-# 带超时等待
-client.wait_processed(timeout=300)  # 300 秒
+client.wait_processed()                # 无超时
+client.wait_processed(timeout=300)     # 超时 300 秒；超时抛 DeadlineExceededError
 ```
 
 ---
@@ -120,125 +137,96 @@ client.wait_processed(timeout=300)  # 300 秒
 列出目录内容。
 
 ```python
-# 基本使用
+# 真实签名：ls(uri, recursive=False, simple=False, output="original",
+#               abs_limit=256, show_all_hidden=True)
 result = client.ls("viking://resources/")
-print(result)
-
-# 返回格式
-{
-    "entries": [
-        {"name": "docs", "type": "dir"},
-        {"name": "README.md", "type": "file"}
-    ]
-}
+result_simple = client.ls("viking://resources/", simple=True)         # 仅返回路径列表
+result_recursive = client.ls("viking://resources/", recursive=True)
 ```
 
 ### 3.2 tree
 
-获取树形结构。
+获取树形结构（**没有 `depth` 参数**）。
 
 ```python
-result = client.tree("viking://resources/", depth=3)
-print(result)
+# 真实签名：tree(uri, output="original", abs_limit=128,
+#                show_all_hidden=True, node_limit=1000)
+result = client.tree("viking://resources/")
+result = client.tree("viking://resources/", node_limit=200)
 ```
 
 ### 3.3 mkdir
 
-创建目录。
-
 ```python
 client.mkdir("viking://resources/newproject/docs")
+client.mkdir("viking://resources/newproject", description="项目根")
 ```
 
 ### 3.4 rm
 
-删除文件或目录。
-
 ```python
-# 删除文件
 client.rm("viking://resources/temp.txt")
-
-# 递归删除目录
 client.rm("viking://resources/oldproject", recursive=True)
 ```
 
 ### 3.5 mv
 
-移动/重命名。
-
 ```python
-client.mv(
-    "viking://resources/oldname",
-    "viking://resources/newname"
-)
+client.mv("viking://resources/oldname", "viking://resources/newname")
 ```
 
 ### 3.6 read
 
-读取文件内容。
-
 ```python
-# 读取 L2 完整内容
+# 真实签名：read(uri, offset=0, limit=-1)
 content = client.read("viking://resources/docs/auth.md")
-
-# 读取指定长度
-content = client.read("viking://resources/docs/auth.md", limit=1000)
+chunk = client.read("viking://resources/docs/auth.md", offset=0, limit=1000)
 ```
 
-### 3.7 abstract
-
-读取 L0 摘要。
+### 3.7 abstract / overview
 
 ```python
-abstract = client.abstract("viking://resources/docs/auth")
-# 返回: "API 认证指南，涵盖 OAuth 2.0、JWT 令牌..."
+abstract = client.abstract("viking://resources/docs/auth")  # 读取 .abstract.md
+overview = client.overview("viking://resources/docs/auth")  # 读取 .overview.md
 ```
 
-### 3.8 overview
-
-读取 L1 概览。
+### 3.8 write
 
 ```python
-overview = client.overview("viking://resources/docs/auth")
-# 返回完整的 L1 内容
+# 写文本到既有文件并刷新 L0/L1/向量
+result = client.write(
+    uri="viking://user/memories/preferences/coding/style.md",
+    content="# 编码偏好\n...",
+    mode="replace",   # 目前实现 replace 模式
+    wait=False,
+)
 ```
 
 ### 3.9 glob
 
-模式匹配查找文件。
-
 ```python
-# 查找所有 md 文件
-result = client.glob(
-    pattern="**/*.md",
-    uri="viking://resources/"
-)
-
-# 查找特定模式
-result = client.glob(
-    pattern="**/api*.md",
-    uri="viking://resources/docs"
-)
-
+# 真实签名：glob(pattern, uri="viking://")
+result = client.glob(pattern="**/*.md", uri="viking://resources/")
 print(result["matches"])
-# ["viking://resources/docs/api/auth.md", ...]
 ```
 
 ### 3.10 grep
 
-文本搜索。
+```python
+# 真实签名：grep(uri, pattern, case_insensitive=False,
+#                node_limit=None, exclude_uri=None)
+result = client.grep(
+    uri="viking://resources/docs",
+    pattern="OAuth",
+    case_insensitive=True,
+)
+print(result["matches"])
+```
+
+### 3.11 stat
 
 ```python
-result = client.grep(
-    pattern="OAuth",
-    uri="viking://resources/docs"
-)
-
-print(result["matches"])
-# [
-#   {"uri": "...", "line": 10, "content": "..."},
-#   ...
-# ]
+info = client.stat("viking://resources/docs/auth.md")
 ```
 
 ---
@@ -247,73 +235,72 @@ print(result["matches"])
 
 ### 4.1 find
 
-简单语义搜索。
-
 ```python
-# 基本搜索
+# 真实签名：
+# find(query, target_uri="", limit=10, score_threshold=None,
+#      filter=None, telemetry=False, since=None, until=None, time_field=None)
+results = client.find("OAuth 认证", target_uri="viking://resources/")
+
+# 通过 filter 限定 context_type（find 没有 context_type 参数）
 results = client.find(
-    "OAuth 认证",
-    target_uri="viking://resources/"
+    "认证",
+    filter={"context_type": "resource"},
+    limit=10,
 )
 
-# 搜索指定类型
+# 时间范围过滤
 results = client.find(
-    "认证方法",
-    target_uri="viking://resources/",
-    context_type="resource"  # resource/memory/skill
+    "近期事件",
+    since="2026-01-01",
+    until="2026-02-01",
+    time_field="created_at",
 )
 
-# 限制返回数量
-results = client.find(
-    "查询",
-    target_uri="viking://resources/",
-    limit=10
-)
-
-# 遍历结果
 for r in results.resources:
     print(f"URI: {r.uri}")
+    print(f"Level: {r.level} (0=L0,1=L1,2=L2)")
     print(f"Score: {r.score:.4f}")
-    print(f"Abstract: {r.abstract}")
+    print(f"Abstract: {r.abstract[:80]}...")
 ```
 
 ### 4.2 search
 
-复杂搜索（需要会话）。
-
 ```python
-# 创建会话
+# 真实签名：
+# search(query, target_uri="", session=None, session_id=None,
+#        limit=10, score_threshold=None, filter=None, telemetry=False,
+#        since=None, until=None, time_field=None)
 session = client.session()
-
-# 复杂搜索
 results = client.search(
     "帮我创建一个用户认证模块",
-    session_info=session,
-    mode=ov.SearchMode.THINKING  # 启用 Rerank
+    session=session,                # 注意：参数名是 session，不是 session_info
+    # 或：session_id="chat_001"
 )
 
-# 获取结果
 for r in results.resources:
     print(f"{r.uri} ({r.score:.4f})")
 
-# 获取查询计划
 if results.query_plan:
-    print(results.query_plan)
+    print("Reasoning:", results.query_plan.reasoning)
+    for q in results.query_plan.queries:
+        print("  -", q.context_type, q.priority, q.query)
 ```
 
-### 4.3 SearchMode
+### 4.3 关于"模式"的说明
 
-```python
-import openviking as ov
+OpenViking 的 Python 客户端 **不暴露 `SearchMode` 枚举**，`find()`/`search()` 也都**没有 `mode` 参数**。
 
-# 默认模式
-ov.SearchMode.DEFAULT
+源码中存在的是内部检索模式 `RetrieverMode`（`THINKING`/`QUICK`），位于 `openviking/retrieve/hierarchical_retriever.py`，由 `HierarchicalRetriever` 内部使用。是否启用 Rerank 取决于 `ov.conf` 中是否提供 `rerank` 配置：
 
-# 思考模式 - 启用 Rerank
-ov.SearchMode.THINKING
-
-# 快速模式 - 禁用 Rerank
-ov.SearchMode.FAST
+```json
+{
+  "rerank": {
+    "provider": "volcengine",
+    "api_base": "https://ark.cn-beijing.volces.com/api/v3",
+    "api_key": "your-api-key",
+    "model": "doubao-seed-rerank"
+  }
+}
 ```
 
 ---
@@ -322,95 +309,95 @@ ov.SearchMode.FAST
 
 ### 5.1 session
 
-创建会话。
+创建或加载会话。
 
 ```python
-# 创建新会话
-session = client.session()
+# 真实签名：session(session_id=None, must_exist=False)
+session = client.session()                                   # 自动生成 ID
+session = client.session(session_id="chat_001")              # 不存在则自动创建
+session = client.session(session_id="chat_001", must_exist=True)  # 不存在抛 NotFoundError
 
-# 恢复已有会话
-session = client.session(session_id="chat_001")
+# 显式管理
+client.create_session("chat_001")
+exists = client.session_exists("chat_001")
+detail = client.get_session("chat_001")
+client.delete_session("chat_001")
 ```
 
 ### 5.2 add_message
 
-添加消息。
-
 ```python
+from openviking.message import TextPart, ContextPart
+
 session = client.session()
 
-# 添加用户消息
 session.add_message(
     "user",
-    [ov.TextPart("如何配置 OpenViking?")]
+    [TextPart(text="如何配置 OpenViking?")],
 )
 
-# 添加助手消息
 session.add_message(
     "assistant",
     [
-        ov.TextPart("配置方法如下："),
-        ov.ContextPart(
+        TextPart(text="配置方法如下："),
+        ContextPart(
             uri="viking://resources/config.md",
-            abstract="配置指南摘要"
-        )
-    ]
+            context_type="resource",
+            abstract="配置指南摘要",
+        ),
+    ],
 )
 ```
 
+> 也可通过客户端层面直接添加：`client.add_message(session_id, role, content=str, parts=list[dict], created_at=..., role_id=...)`。
+
 ### 5.3 used
 
-记录使用的上下文。
+记录实际使用的上下文/技能。
 
 ```python
-# 记录使用的资源
 session.used(contexts=[
     "viking://resources/docs/auth.md",
-    "viking://user/memories/preferences/ui.md"
+    "viking://user/memories/preferences/ui/style.md",
 ])
 
-# 记录使用的技能
 session.used(skill={
     "uri": "viking://agent/skills/code-search",
     "input": "search 'auth'",
     "output": "found 5 files",
-    "success": True
+    "success": True,
 })
 ```
 
 ### 5.4 commit
 
-提交会话。
+提交会话：Phase 1 同步归档（PathLock 保护），Phase 2 后台异步提取记忆。
 
 ```python
 result = session.commit()
+# 实际返回（Session.commit_async 中可见）：
+# {
+#   "session_id": "...",
+#   "status": "accepted",
+#   "task_id": "...",                  # 可用 client.get_task() 跟踪 Phase 2
+#   "archive_uri": "viking://session/.../history/archive_NNN/",
+#   "archived": True,
+#   "trace_id": "..."
+# }
 
-# 返回值
-{
-    "status": "committed",
-    "memories_extracted": 5,
-    "active_count_updated": 2,
-    "archived": True,
-    "extracted_memories": [
-        {
-            "type": "preferences",
-            "action": "UPDATE",
-            "uri": "viking://user/memories/preferences/..."
-        }
-    ]
-}
+# 跟踪记忆提取进度
+task = client.get_task(result["task_id"])
 ```
 
-### 5.5 sessions
-
-列出所有会话。
+### 5.5 list_sessions
 
 ```python
-# 列出所有会话
-sessions = client.sessions()
-
-# 过滤条件
-sessions = client.sessions(limit=10, offset=0)
+sessions = client.list_sessions()           # ⚠️ 方法名是 list_sessions（不是 sessions）
+ctx = client.get_session_context(
+    "chat_001",
+    token_budget=128_000,
+)
+archive = client.get_session_archive("chat_001", "archive_001")
 ```
 
 ---
@@ -419,27 +406,30 @@ sessions = client.sessions(limit=10, offset=0)
 
 ### 6.1 link
 
-创建资源关联。
+创建关联（支持单个或多个 URI）。
 
 ```python
+# 真实签名：link(from_uri, uris, reason="")
+# uris 既可以是 str，也可以是 List[str]
 client.link(
     from_uri="viking://resources/docs/auth",
     uris=[
         "viking://resources/docs/security",
-        "viking://resources/docs/oauth"
+        "viking://resources/docs/oauth",
     ],
-    reason="相关安全文档"
+    reason="相关安全文档",
 )
 ```
 
 ### 6.2 unlink
 
-删除资源关联。
+删除单个关联。
 
 ```python
+# 真实签名：unlink(from_uri, uri)  ⚠️ 第二个参数是单个 uri，不是列表
 client.unlink(
     from_uri="viking://resources/docs/auth",
-    uris=["viking://resources/docs/security"]
+    uri="viking://resources/docs/security",
 )
 ```
 
@@ -449,12 +439,11 @@ client.unlink(
 
 ```python
 relations = client.relations("viking://resources/docs/auth")
-
-print(relations)
-# {
-#   "viking://resources/docs/security": "相关安全文档",
-#   "viking://resources/docs/oauth": "OAuth 实现"
-# }
+# 真实返回：List[{"uri": "...", "reason": "..."}]
+# [
+#   {"uri": "viking://resources/docs/security", "reason": "相关安全文档"},
+#   {"uri": "viking://resources/docs/oauth",    "reason": "OAuth 实现"},
+# ]
 ```
 
 ---
@@ -463,22 +452,27 @@ print(relations)
 
 ### 7.1 export_ovpack
 
-导出为 OVPack 格式。
+导出为 `.ovpack` 文件。
 
 ```python
-result = client.export_ovpack(
+# 真实签名：export_ovpack(uri, to)
+exported_path = client.export_ovpack(
     uri="viking://resources/myproject",
-    output_path="./myproject.ovpack"
+    to="./myproject.ovpack",
 )
 ```
 
 ### 7.2 import_ovpack
 
-导入 OVPack 文件。
+导入 `.ovpack` 文件到指定父路径。
 
 ```python
-result = client.import_ovpack(
-    input_path="./myproject.ovpack"
+# 真实签名：import_ovpack(file_path, target, force=False, vectorize=True)
+imported_root_uri = client.import_ovpack(
+    file_path="./myproject.ovpack",
+    target="viking://user/alice/resources/references/",
+    force=False,
+    vectorize=True,
 )
 ```
 
@@ -489,34 +483,31 @@ result = client.import_ovpack(
 ### 8.1 ContextType
 
 ```python
-from openviking import ContextType
+# ⚠️ 不在 openviking 顶层包，需从 openviking_cli 导入
+from openviking_cli.retrieve.types import ContextType
 
-ContextType.RESOURCE  # 资源
-ContextType.MEMORY   # 记忆
-ContextType.SKILL    # 技能
+ContextType.MEMORY    # "memory"
+ContextType.RESOURCE  # "resource"
+ContextType.SKILL     # "skill"
 ```
 
-### 8.2 SearchMode
+### 8.2 ~~SearchMode~~ —— 不存在
 
-```python
-from openviking import SearchMode
-
-SearchMode.DEFAULT   # 默认
-SearchMode.THINKING  # 思考模式（Rerank）
-SearchMode.FAST      # 快速模式
-```
+OpenViking 客户端**没有 `SearchMode`**。`find()`/`search()` 不接收 `mode` 参数。
+内部 `RetrieverMode`（位于 `openviking/retrieve/hierarchical_retriever.py`）只是 `HierarchicalRetriever` 的内部枚举，不是公共 API。
 
 ### 8.3 FindResult
 
 ```python
+# 来自 openviking_cli/retrieve/types.py
 @dataclass
 class FindResult:
     memories: List[MatchedContext]
     resources: List[MatchedContext]
     skills: List[MatchedContext]
-    query_plan: Optional[QueryPlan]
+    query_plan: Optional[QueryPlan]              # 仅 search() 时填充
     query_results: Optional[List[QueryResult]]
-    total: int
+    total: int                                    # 自动计算
 ```
 
 ### 8.4 MatchedContext
@@ -526,11 +517,24 @@ class FindResult:
 class MatchedContext:
     uri: str
     context_type: ContextType
-    is_leaf: bool
-    abstract: str
-    score: float
-    relations: List[RelatedContext]
+    level: int = 2                               # 0=L0 / 1=L1 / 2=L2（默认）
+    abstract: str = ""
+    overview: Optional[str] = None
+    category: str = ""                           # 记忆细分类
+    score: float = 0.0
+    match_reason: str = ""
+    relations: List[RelatedContext] = field(default_factory=list)
 ```
+
+> ⚠️ **没有 `is_leaf` 字段**。
+
+### 8.5 Part 类型
+
+```python
+from openviking.message import TextPart, ContextPart, ToolPart
+```
+
+详见 [会话管理详解](./05-会话管理详解.md#3-消息结构)。
 
 ---
 
