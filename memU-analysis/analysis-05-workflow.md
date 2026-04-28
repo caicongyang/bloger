@@ -216,73 +216,165 @@ flowchart TB
     E2 -->|否| END
 ```
 
-### 5.2 LLM 拦截器
+### 5.2 LLM 拦截器（带过滤器、优先级、丰富上下文）
 
-```python
-class LLMInterceptorRegistry:
-    """LLM 调用拦截器"""
-    
-    def register_before(
-        self,
-        fn: Callable,
-        name: str | None = None,
-        priority: int = 0,
-        where: dict | Callable | None = None,
-    ) -> LLMInterceptorHandle:
-        """注册 LLM 调用前的拦截器"""
-    
-    def register_after(
-        self,
-        fn: Callable,
-        name: str | None = None,
-        priority: int = 0,
-        where: dict | Callable | None = None,
-    ) -> LLMInterceptorHandle:
-        """注册 LLM 调用后的拦截器"""
-    
-    def register_on_error(
-        self,
-        fn: Callable,
-        name: str | None = None,
-        priority: int = 0,
-        where: dict | Callable | None = None,
-    ) -> LLMInterceptorHandle:
-        """注册 LLM 调用错误的拦截器"""
+memU 把对 LLM 的每一次调用统一包装在 `LLMClientWrapper._run_llm_call` 中，所有 `chat / embed / vision / transcribe` 调用都会经过 **before / after / on_error** 三个钩子。
+
+#### 调用上下文 `LLMCallContext`
+
+```17:27:memU/src/memu/llm/wrapper.py
+@dataclass(frozen=True)
+class LLMCallContext:
+    profile: str
+    request_id: str
+    trace_id: str | None
+    operation: str | None       # "chat" / "embed" / "vision" / "transcribe"
+    step_id: str | None         # 来自当前 WorkflowStep
+    provider: str | None        # "openai" / "lazyllm" / ...
+    model: str | None
+    tags: Mapping[str, Any] | None
 ```
 
-### 5.3 使用示例
+每次 LLM 调用都会自动生成 `request_id`，并把当前所在的 step_id、profile（"default" / "embedding" / 你自己定义的 profile）等信息注入。这意味着拦截器可以在**调用现场**就拿到非常丰富的元信息，不需要从调用栈反推。
+
+#### 过滤器 `LLMCallFilter`：精准定向拦截
+
+```61:86:memU/src/memu/llm/wrapper.py
+@dataclass(frozen=True)
+class LLMCallFilter:
+    operations: set[str] | None = None
+    step_ids: set[str] | None = None
+    providers: set[str] | None = None
+    models: set[str] | None = None
+    statuses: set[str] | None = None
+
+    def matches(self, ctx: LLMCallContext, status: str | None) -> bool:
+        if self.operations and (ctx.operation or "").lower() not in self.operations:
+            return False
+        if self.step_ids and (ctx.step_id or "") not in self.step_ids:
+            return False
+        if self.providers and (ctx.provider or "").lower() not in self.providers:
+            return False
+        ...
+        return True
+```
+
+这套 filter 让你可以做这样的"精确狙击"：
 
 ```python
-# 记录所有 LLM 调用
+from memu.llm.wrapper import LLMCallFilter
+
+# 只拦截 extract_items 这一个 step 的 chat 调用，用于专门记录抽取过程
+service.intercept_after_llm_call(
+    fn=record_extraction,
+    name="extraction_audit",
+    priority=10,
+    where=LLMCallFilter(
+        operations={"chat"},
+        step_ids={"extract_items"},
+    ),
+)
+
+# 只对 OpenAI 的 embedding 调用统计 token
+service.intercept_after_llm_call(
+    fn=count_embedding_tokens,
+    where=LLMCallFilter(operations={"embed"}, providers={"openai"}),
+)
+
+# where 也可以是 callable
+service.intercept_before_llm_call(
+    fn=cache_lookup,
+    where=lambda ctx, status: ctx.tags and ctx.tags.get("cacheable"),
+)
+```
+
+#### 优先级与执行顺序
+
+- **before** 拦截器按 `priority` **降序**执行（高优先级先跑）；
+- **after / on_error** 按相反顺序执行——**先注册的最后执行**，符合"洋葱模型"。
+
+这套"中间件式"的设计让两类典型需求都能并存：
+
+| 场景 | 推荐 priority |
+|------|--------------|
+| **缓存 / 短路调用**（before 阶段就返回结果） | 高优先级（先于 logging/metrics） |
+| **指标采集 / 链路追踪**（不能影响功能） | 中等 |
+| **审计 / 持久化记录**（after 阶段写入） | 低优先级（最后执行） |
+
+### 5.3 拦截器使用示例
+
+```python
+import time
+from memu.llm.wrapper import LLMCallFilter
+
 service = MemoryService(...)
 
-# Before 拦截器
-service.intercept_before_llm_call(
-    fn=lambda *args, **kwargs: print(f"LLM调用: {args}"),
-    name="logger",
-    priority=0
+# 1. 简单的"打印每次调用耗时"
+async def latency_logger(context, request, response, usage):
+    if usage and usage.latency_ms is not None:
+        print(f"[{context.operation}] {context.model} took {usage.latency_ms:.0f}ms")
+
+service.intercept_after_llm_call(fn=latency_logger, name="latency")
+
+# 2. 只对 chat 调用计费
+async def billing_recorder(context, request, response, usage):
+    if usage and usage.total_tokens:
+        await billing_db.record(
+            user_id=context.tags.get("user_id"),
+            tokens=usage.total_tokens,
+            model=context.model,
+        )
+
+service.intercept_after_llm_call(
+    fn=billing_recorder,
+    where=LLMCallFilter(operations={"chat"}),
 )
 
-# After 拦截器
-service.intercept_after_llm_call(
-    fn=lambda response: print(f"LLM响应: {response}"),
-    name="response_logger",
-    priority=0
-)
+# 3. on_error 自动重试（更适合放在客户端层；这里只演示）
+async def slack_alert(context, request, error):
+    await slack.send(f"LLM call {context.request_id} failed: {error}")
+
+service.intercept_on_error_llm_call(fn=slack_alert)
 ```
 
-### 5.4 工作流拦截器
+### 5.4 工作流拦截器（更轻量）
+
+工作流拦截器**没有** `where filter` / `priority` 这些复杂特性——这是有意的设计：工作流步骤通常较粗粒度（每个 memorize 调用最多走过 7 个 step），不需要精确过滤。
+
+```56:115:memU/src/memu/workflow/interceptor.py
+class WorkflowInterceptorRegistry:
+    """
+    Registry for workflow step interceptors.
+
+    Interceptors are called before and after each workflow step execution.
+    Unlike LLM interceptors, workflow interceptors do not support filtering,
+    priority, or ordering - they are called in registration order.
+    """
+
+    def register_before(self, fn, *, name=None) -> WorkflowInterceptorHandle: ...
+    def register_after(self, fn, *, name=None) -> WorkflowInterceptorHandle: ...
+    def register_on_error(self, fn, *, name=None) -> WorkflowInterceptorHandle: ...
+```
+
+如果在 worflow 拦截器中也需要按 `step_id` 过滤，自己在 fn 里加个 if 即可：
 
 ```python
-# 拦截工作流步骤
-service.intercept_before_workflow_step(
-    fn=lambda step_context, state: print(f"步骤: {step_context.step_id}")
-)
+async def trace_extract_only(step_context, state):
+    if step_context.step_id != "extract_items":
+        return
+    print(f"extract_items started, resource_url={state.get('resource_url')}")
 
-service.intercept_after_workflow_step(
-    fn=lambda step_context, state: print(f"完成: {step_context.step_id}")
-)
+service.intercept_before_workflow_step(fn=trace_extract_only)
 ```
+
+### 5.5 两套拦截器的搭配场景
+
+| 需求 | 用 LLM 拦截器 | 用 Workflow 拦截器 |
+|------|-------------|------------------|
+| 记录每次 LLM 调用的 token / latency | ✅ | ❌（粒度太粗） |
+| 给"分类摘要更新"这一个 step 加缓存 | ❌ | ✅（之前/之后处理 state） |
+| 一次 memorize 全程链路追踪 | ✅（细粒度 span） | ✅（外层 trace） |
+| 失败时报警 | ✅（精确到模型/步骤） | ✅（粗粒度兜底） |
 
 ## 6. Memorize 工作流详解
 

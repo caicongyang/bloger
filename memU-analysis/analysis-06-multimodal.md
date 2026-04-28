@@ -77,16 +77,38 @@ async def _preprocess_conversation(
     return resources
 ```
 
-**对话格式示例**：
-```
-原始:
-User: 你好
-Assistant: 你好！
+**对话格式示例**（实际由 `format_conversation_for_preprocess` 产出，预期输入是 JSON 而非纯文本）：
 
-处理后:
-[0] User: 你好
-[1] Assistant: 你好！有什么可以帮你？
+```7:36:memU/src/memu/utils/conversation.py
+def format_conversation_for_preprocess(raw_text: str) -> str:
+    """
+    Normalize a conversation into a line-based format suitable for LLM preprocessing prompts.
+
+    Supported input formats:
+    - A JSON list of messages: [{"role": "...", "content": "...", "created_at": "..."}]
+    - A JSON dict with a "content" list: {"content": [ ...messages... ]}
+
+    Output format:
+    - One message per line
+    - Each line starts with an index marker: "[{idx}]"
+    - If a created_at is available, it is included after the index
+    - The role is included in square brackets: "[user]" / "[assistant]" etc.
+    """
 ```
+
+```
+输入 (JSON):
+[
+  {"role": "user",      "content": "你好",            "created_at": "2026-04-27T08:00"},
+  {"role": "assistant", "content": "你好！有什么可以帮你？"}
+]
+
+经 format_conversation_for_preprocess 处理后:
+[0] 2026-04-27T08:00 [user]: 你好
+[1] [assistant]: 你好！有什么可以帮你？
+```
+
+> 注意：源码注释里特别强调 *"always use the original JSON-derived, indexed conversation text for downstream segmentation"*——LLM 的 segment 输出只是返回 `start/end` 行号区间，**真正的切片是基于这份 indexed 文本进行的**。这是 memU 防止 LLM 改写对话内容（丢字段、改时间）导致下游解析出问题的关键设计。
 
 ### 2.2 文档 (document)
 
@@ -220,20 +242,28 @@ async def _preprocess_audio(
 
 ### 3.1 客户端类型
 
+memU 在 `src/memu/llm/` 下提供了三种 LLM client backend，由 `LLMConfig.client_backend` 切换：
+
 ```mermaid
 graph TB
-    LLM[LLM Client Interface]
-    
-    subgraph "支持的后端"
-        OAI[OpenAI SDK]
-        HTTP[HTTP Client]
-        LLM[LazyLLM]
+    IF[LLMClient Interface<br/>chat / vision / embed / transcribe]
+
+    subgraph backends["src/memu/llm/"]
+        OAI[OpenAISDKClient<br/>client_backend = sdk]
+        HTTP[HTTPLLMClient<br/>client_backend = httpx]
+        LZ[LazyLLMClient<br/>client_backend = lazyllm_backend]
     end
-    
-    LLM --> OAI
-    LLM --> HTTP
-    LLM --> LLM
+
+    IF --> OAI
+    IF --> HTTP
+    IF --> LZ
 ```
+
+| backend | 适合场景 | 实现文件 |
+|---------|----------|----------|
+| `sdk` （默认） | OpenAI 官方 SDK，类型安全；走 `AsyncOpenAI` | `llm/openai_sdk.py` |
+| `httpx` | 自实现 HTTP 客户端，按 provider 拆分 backend，更易扩展 | `llm/http_client.py` |
+| `lazyllm_backend` | 通过 [LazyLLM](https://github.com/LazyAGI/LazyLLM) 接入国内厂商（Qwen、Doubao、SiliconFlow 等） | `llm/lazyllm_client.py` |
 
 ### 3.2 OpenAI SDK 客户端
 
@@ -294,13 +324,24 @@ class HTTPLLMClient:
         ...
 ```
 
-**支持的 Provider**：
-- OpenAI
-- Anthropic
-- Azure OpenAI
-- Google Gemini
-- Claude
-- 自定义
+**`httpx` backend 实际支持的 provider**（取决于 `LLMConfig.provider`）：
+
+```1:7:memU/src/memu/llm/backends/__init__.py
+from memu.llm.backends.base import LLMBackend
+from memu.llm.backends.doubao import DoubaoLLMBackend
+from memu.llm.backends.grok import GrokBackend
+from memu.llm.backends.openai import OpenAILLMBackend
+from memu.llm.backends.openrouter import OpenRouterLLMBackend
+```
+
+| provider | 用法要点 |
+|----------|---------|
+| `openai` | OpenAI 兼容 API（含 vLLM、Ollama、OpenAI Compatible 模型） |
+| `doubao` | 字节跳动豆包，自定义 endpoint `/api/v3/...` |
+| `grok` | xAI Grok，自动把 `base_url` 切到 `https://api.x.ai/v1` |
+| `openrouter` | OpenRouter 聚合网关，可一键切换 Anthropic / Gemini / Mistral 等 |
+
+> **备注**：Anthropic、Gemini、Bedrock 等"非 OpenAI 兼容"的 provider，目前**没有内置 backend**，需要走 `openrouter` 中转或扩展自定义 `LLMBackend`。如果直接配 `provider="anthropic"`，会因匹配不到 backend 而抛错。
 
 ### 3.4 多 Profile 配置
 
@@ -336,73 +377,82 @@ service = MemoryService(
 
 ## 4. 向量模型
 
-### 4.1 支持的 Embedding 模型
+### 4.1 内置 Embedding backend
 
-```python
-# OpenAI
-- text-embedding-3-small
-- text-embedding-3-large
-- text-embedding-ada-002
+embedding 走的是独立模块 `src/memu/embedding/`，目前只有两套实现：
 
-# Cohere
-- embed-multilingual-v3.0
-- embed-english-v3.0
-
-# Voyage
-- voyage-3
-- voyage-lite-2
-
-# 自定义
-- 任何支持 embedding API 的模型
+```
+memU/src/memu/embedding/backends/
+├── openai.py    # provider=openai
+└── doubao.py    # provider=doubao
 ```
 
-### 4.2 Embedding 配置
+也就是说，凡是声明自己 *OpenAI 兼容* 的 embedding 服务（Voyage、Cohere、SiliconFlow、本地 vLLM、Ollama 等）都可以挂在 `provider="openai"` 上，把 `base_url` 改到对应 endpoint 就行；真正非 OpenAI 兼容的字节豆包则走 `provider="doubao"`。
+
+### 4.2 Embedding 配置示例
 
 ```python
 llm_profiles={
+    # 默认：OpenAI text-embedding-3-small
     "embedding": {
-        "base_url": "https://api.voyageai.com/v1",
-        "api_key": "voyage-...",
-        "embed_model": "voyage-3.5-lite",
-        "provider": "voyageai"
-    }
+        "provider": "openai",
+        "base_url": "https://api.openai.com/v1",
+        "api_key": "sk-...",
+        "embed_model": "text-embedding-3-small",
+    },
+    # 替换：用 SiliconFlow 的 BGE（OpenAI 兼容）
+    # "embedding": {
+    #     "provider": "openai",
+    #     "base_url": "https://api.siliconflow.cn/v1",
+    #     "api_key": "sk-sf-...",
+    #     "embed_model": "BAAI/bge-m3",
+    # },
 }
 ```
+
+> 关于 LazyLLM：如果选 `client_backend="lazyllm_backend"`，可以通过 `lazyllm_source.embed_source` 接入更多国内 embedding 厂商，但前提是 `lazyllm` 已安装并在该厂商上跑通。
 
 ## 5. Blob 存储
 
 ### 5.1 本地文件系统
 
-```python
-# src/memu/blob/local_fs.py
+```10:80:memU/src/memu/blob/local_fs.py
 class LocalFS:
-    """本地文件系统存储"""
-    
-    def __init__(self, resources_dir: str):
-        self.resources_dir = resources_dir
-    
-    async def fetch(
-        self,
-        resource_url: str,
-        modality: str,
-    ) -> tuple[str, str]:
-        """
-        获取资源
-        返回: (本地路径, 原始文本)
-        """
-        
-        # 远程 URL - 下载
-        if resource_url.startswith(("http://", "https://")):
-            local_path = await self._download(resource_url)
-        # 本地文件 - 读取
-        else:
-            local_path = resource_url
-        
-        # 读取内容
-        text = await self._read_text(local_path, modality)
-        
-        return local_path, text
+    def __init__(self, base_dir: str):
+        self.base = pathlib.Path(base_dir)
+        self.base.mkdir(parents=True, exist_ok=True)
+
+    async def fetch(self, url: str, modality: str) -> tuple[str, str | None]:
+        # Local path
+        p = pathlib.Path(url)
+        if p.exists():
+            dst = self.base / p.name
+            if str(p.resolve()) != str(dst.resolve()):
+                shutil.copyfile(p, dst)
+            text = None
+            if modality in ("conversation", "text", "document"):
+                text = dst.read_text(encoding="utf-8")
+            return str(dst), text
+
+        # HTTP - get clean filename
+        filename = self._get_filename_from_url(url, modality)
+        dst = self.base / filename
+
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            dst.write_bytes(r.content)
+        text = None
+        if modality in ("conversation", "text", "document"):
+            text = r.text
+        return str(dst), text
 ```
+
+要点：
+
+- 只有 `conversation / text / document` 三种 modality 会读出 `text`，图像/视频/音频不读文本，下游通过 `local_path` 让 Vision/STT 客户端自取；
+- 远程 URL 会自动下载到 `base_dir`，并对 query string、`grab.php` 之类的"假后缀"做了清洗（见 `_get_filename_from_url`）；
+- 这是为下游记忆抽取留持久化痕迹的关键——一旦记忆链条出问题，可以根据 `Resource.local_path` 回溯到原始资源。
 
 ### 5.2 资源目录结构
 
@@ -608,18 +658,19 @@ service = MemoryService(
         }
     },
     
-    # 数据库配置
+    # 数据库配置（合法 vector provider 是 bruteforce / pgvector / none）
     database_config={
         "metadata_store": {"provider": "inmemory"},
-        "vector_index": {"provider": "inmemory"}
+        "vector_index": {"provider": "bruteforce"}
     },
-    
-    # Blob 存储
+
+    # Blob 存储（local 是默认 provider，目录默认 ./data/resources）
     blob_config={
+        "provider": "local",
         "resources_dir": "./resources"
     },
     
-    # 记忆配置
+    # 记忆配置（默认只启用 profile + event；下面这份是显式打开全部 6 类）
     memorize_config={
         "memory_types": ["profile", "event", "knowledge", "behavior", "skill", "tool"],
         "enable_item_reinforcement": True,
@@ -629,25 +680,22 @@ service = MemoryService(
         "category_update_llm_profile": "default"
     },
     
-    # 检索配置
+    # 检索配置（这些就是源码默认值，列出来便于对照）
     retrieve_config={
         "method": "rag",
         "route_intention": True,
         "sufficiency_check": True,
-        "category": {"enabled": True, "top_k": 3},
-        "item": {"enabled": True, "top_k": 10},
+        "category": {"enabled": True, "top_k": 5},
+        "item": {"enabled": True, "top_k": 5, "ranking": "salience", "recency_decay_days": 30.0},
         "resource": {"enabled": True, "top_k": 5}
     },
-    
-    # 用户模型
-    user_config={
-        "model": {
-            "user_id": str,
-            "team_id": str | None
-        }
-    }
+
+    # 用户模型：必须传 BaseModel 子类，而不是 dict
+    user_config={"model": MyTenantUser},
 )
 ```
+
+> 关于 `user_config.model`：必须是 `pydantic.BaseModel` 的子类（参考 8.3 多租户配置），传 `{"user_id": str, ...}` 这种 type-hint 字典会被 Pydantic 校验拒掉。
 
 ### 8.2 环境变量
 
@@ -667,32 +715,31 @@ export CUSTOM_API_KEY="..."
 ### 9.1 生产环境配置
 
 ```python
-# 生产环境使用 PostgreSQL
+# 生产环境：PostgreSQL + pgvector（向量列写在同一张表里）
 service = MemoryService(
     database_config={
         "metadata_store": {
             "provider": "postgres",
-            "connection": {
-                "host": "db.example.com",
-                "port": 5432,
-                "database": "memu_prod",
-                "user": "memu",
-                "password": "secure_password"
-            }
+            "dsn": "postgresql://memu:secure_password@db.example.com:5432/memu_prod",
+            "ddl_mode": "validate",
         },
-        "vector_index": {"provider": "postgres"}
+        # 不显式给 vector_index 时，postgres 会自动联动到 pgvector，dsn 复用 metadata_store
+        "vector_index": {"provider": "pgvector"},
     }
 )
 ```
 
+> `MetadataStoreConfig` 只接受 `provider / ddl_mode / dsn` 三个字段，不再支持 `host/port/database/user/password` 拆开传——务必拼成 DSN。
+> `VectorIndexConfig.provider` 合法值是 `bruteforce | pgvector | none`，没有 `postgres`、`inmemory` 这种字面量。
+
 ### 9.2 开发环境配置
 
 ```python
-# 开发环境使用内存
+# 开发环境：纯内存，零依赖
 service = MemoryService(
     database_config={
         "metadata_store": {"provider": "inmemory"},
-        "vector_index": {"provider": "inmemory"}
+        "vector_index": {"provider": "bruteforce"},  # InMemory 走 numpy bruteforce
     }
 )
 ```
@@ -721,11 +768,15 @@ result = await service.retrieve(
 
 memU 的多模态和集成能力：
 
-1. **统一接口** - 多种模态统一处理
-2. **灵活客户端** - 支持多种 LLM 提供商
-3. **可扩展存储** - 本地/云端多种选择
-4. **Prompt 定制** - 完全可配置的提示词
-5. **多租户支持** - 企业级应用支持
-6. **易于集成** - 简单的 API 设计
+1. **统一接口**：所有 modality 走同一个 `_memorize_preprocess_multimodal` 调度，下游永远是 `(text, caption)` 二元组；
+2. **客户端分层**：`sdk` / `httpx` / `lazyllm_backend` 三种 LLM client backend 各司其职，国产模型走 LazyLLM、OpenRouter 或 Doubao backend；
+3. **embedding 极简**：内置只有 OpenAI 兼容 + Doubao，其他 provider 都通过"OpenAI 兼容入口"接入；
+4. **本地优先 blob**：`LocalFS.fetch` 透明处理本地路径与远程 URL，按 modality 决定是否读文本；
+5. **Prompt 定制可粒度到块**：multimodal preprocess、memory type、category summary 都支持 `CustomPrompt(dict[str, PromptBlock])` 局部覆盖；
+6. **多租户支持**：通过自定义 `UserModel` + `where` 实现 user/agent/session 级数据隔离。
 
-这使得 memU 能够适配各种实际应用场景。
+如果你打算直接复用 memU 跑生产，重点关注三件事：
+
+- **provider 是否真有 backend**（很多人误以为加 `provider="anthropic"` 就能走 Claude）；
+- **数据库与向量索引的合法 provider 字面量**（`bruteforce / pgvector` 这种细节很容易踩坑）；
+- **是否启用 salience + reinforcement**（默认 `similarity` 排序，启用要同时改 `MemorizeConfig.enable_item_reinforcement` 和 `RetrieveItemConfig.ranking`，详见 [analysis-09](./analysis-09-salience-and-reinforcement.md)）。

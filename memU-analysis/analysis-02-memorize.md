@@ -105,39 +105,114 @@ async def _memorize_extract_items(self, state: WorkflowState, step_context: Any)
     return state
 ```
 
-**职责**：使用 LLM 从文本中提取结构化记忆
+**职责**：使用 LLM 从文本中提取结构化记忆。系统支持 6 种记忆类型，但**默认只启用 `profile` 与 `event`**：
 
-**关键 Prompt**：
-```python
-# 6 种记忆类型的提取 Prompt
-memory_types = [
-    "profile",    # 用户画像
-    "event",      # 事件
-    "knowledge",  # 知识
-    "behavior",   # 行为模式
-    "skill",      # 技能
-    "tool"        # 工具使用
-]
+```4:13:memU/src/memu/prompts/memory_type/__init__.py
+# DEFAULT_MEMORY_TYPES: list[str] = ["profile", "event", "knowledge", "behavior"]
+DEFAULT_MEMORY_TYPES: list[str] = ["profile", "event"]
+
+PROMPTS: dict[str, str] = {
+    "profile": profile.PROMPT.strip(),
+    "event": event.PROMPT.strip(),
+    "knowledge": knowledge.PROMPT.strip(),
+    "behavior": behavior.PROMPT.strip(),
+    "skill": skill.PROMPT.strip(),
+    "tool": tool.PROMPT.strip(),
+}
 ```
+
+| 类型 | 默认开启 | 用途 |
+|------|----------|------|
+| `profile` | ✅ | 用户长期画像（基础信息、偏好、习惯） |
+| `event`   | ✅ | 用户经历的具体事件（时间、地点、人物） |
+| `knowledge` | ❌ | 用户陈述的知识/事实 |
+| `behavior` | ❌ | 重复出现的行为模式 |
+| `skill`   | ❌ | 用户掌握的技能 |
+| `tool`    | ❌ | 工具调用记忆，附带 `when_to_use / metadata / tool_calls` 三个字段（写入 `MemoryItem.extra`） |
+
+要启用更多类型，在 `MemorizeConfig.memory_types` 里显式列出即可：
+
+```python
+service = MemoryService(
+    memorize_config={
+        "memory_types": ["profile", "event", "knowledge", "skill", "tool"],
+    },
+)
+```
+
+#### Prompt 的"块化组合"架构
+
+每个 memory type 的 prompt 都不是一整块大字符串，而是被拆成**七个语义独立的块**（参见 `prompts/memory_type/profile.py`）：
+
+```mermaid
+flowchart LR
+    OBJ["objective<br/>任务目标"] --> WF["workflow<br/>处理流程"]
+    WF --> RUL["rules<br/>抽取规则"]
+    RUL --> CAT["category<br/>{categories_str}"]
+    CAT --> OUT["output<br/>XML 输出格式"]
+    OUT --> EX["examples<br/>I/O 示例"]
+    EX --> IN["input<br/>{resource}"]
+```
+
+```30:38:memU/src/memu/prompts/memory_type/__init__.py
+DEFAULT_MEMORY_CUSTOM_PROMPT_ORDINAL: dict[str, int] = {
+    "objective": 10,
+    "workflow": 20,
+    "rules": 30,
+    "category": 40,
+    "output": 50,
+    "examples": 60,
+    "input": 90,
+}
+```
+
+实际效果：
+
+- 用户可以**只覆盖某一块**（比如只改 `examples`），而不用复制整段 prompt；
+- 各块按 ordinal 排序后用 `\n\n` 拼接成最终的 system prompt；
+- 输出格式从早期的 JSON（`PROMPT_LEGACY`）切换到 **XML `<item><memory>...`** 结构，对 LLM 来说边界更清晰、更容易稳定解析。
 
 **输出格式**：
 ```python
 # 每条记忆的格式
 ( memory_type, summary_text, category_names )
 # 例如:
-("profile", "用户喜欢在下午2点喝咖啡", ["生活习惯", "偏好"])
+("profile", "用户喜欢在下午 2 点喝咖啡", ["生活习惯", "偏好"])
 ```
 
-### Step 4: dedupe_merge (去重合并)
+### Step 4: dedupe_merge（去重合并）
 
 ```python
 def _memorize_dedupe_merge(self, state: WorkflowState, step_context: Any) -> WorkflowState:
-    # 占位符，未来用于去重逻辑
+    # 这一步本身只是 pass-through，真正的去重发生在写库时
     state["resource_plans"] = state.get("resource_plans", [])
     return state
 ```
 
-> 目前是占位符，未来会实现基于内容哈希的去重
+> ⚠️ **早期博客曾说"目前是占位符"，事实上去重逻辑已经存在**——只是它被**下沉到了仓储层**：
+
+启用 `MemorizeConfig.enable_item_reinforcement=True` 后，写入流程会调用 `MemoryItemRepo.create_item(reinforce=True)`，等价于走到 `create_item_reinforce`：
+
+```122:147:memU/src/memu/database/inmemory/repositories/memory_item_repo.py
+def create_item_reinforce(
+    self, *, resource_id, memory_type, summary, embedding, user_data, ...
+) -> MemoryItem:
+    content_hash = compute_content_hash(summary, memory_type)
+
+    # 在同一 user scope 下查找相同内容的记忆
+    existing = self._find_by_hash(content_hash, user_data)
+    if existing:
+        # 找到就强化，而不是再插一条重复记忆
+        current_extra = existing.extra or {}
+        current_count = current_extra.get("reinforcement_count", 1)
+        existing.extra = {
+            **current_extra,
+            "reinforcement_count": current_count + 1,
+            "last_reinforced_at": pendulum.now("UTC").isoformat(),
+        }
+```
+
+也就是说，`dedupe_merge` 这一步留在工作流里、handler 是空的，是为了**留出 hook 位**：用户可以通过 `service.replace_step("dedupe_merge", ...)` 注入自己的去重/合并策略（比如基于 LLM 的语义合并、跨 user 的归并等）。详细机制见 [第 09 篇：记忆强化与 Salience 评分](./analysis-09-salience-and-reinforcement.md)。
 
 ### Step 5: categorize_items (分类记忆项)
 
@@ -342,25 +417,48 @@ async def _prepare_audio_text(self, local_path, text, llm_client):
 
 ## 6. 配置选项
 
+`MemorizeConfig` 是 Pydantic 模型，源码在 `src/memu/app/settings.py`：
+
 ```python
-@dataclass
-class MemorizeConfig:
-    # 记忆类型配置
-    memory_types: list[MemoryType] | None = None
-    
-    # LLM Profile 配置
-    preprocess_llm_profile: str | None = None
-    memory_extract_llm_profile: str | None = None
-    category_update_llm_profile: str | None = None
-    
-    # 预处理提示词
-    multimodal_preprocess_prompts: dict[str, str] = {}
-    memory_type_prompts: dict[MemoryType, str] = {}
-    
-    # 高级特性
-    enable_item_reinforcement: bool = False  # 记忆强化
-    enable_item_references: bool = False    # 引用支持
+class MemorizeConfig(BaseModel):
+    # —— 类别匹配阈值 ——
+    category_assign_threshold: float = 0.25
+
+    # —— 多模态预处理 ——
+    multimodal_preprocess_prompts: dict[str, str | CustomPrompt] = {}
+    preprocess_llm_profile: str = "default"
+
+    # —— 记忆抽取 ——
+    memory_types: list[str] = ["profile", "event"]    # 默认仅这两种
+    memory_type_prompts: dict[str, str | CustomPrompt] = {...}
+    memory_extract_llm_profile: str = "default"
+
+    # —— 类别管理 ——
+    memory_categories: list[CategoryConfig] = [...]
+    default_category_summary_prompt: str | CustomPrompt = CATEGORY_SUMMARY_PROMPT
+    default_category_summary_target_length: int = 400
+    category_update_llm_profile: str = "default"
+
+    # —— 高级特性 ——
+    enable_item_references: bool = False        # 支持 [ref:ITEM_ID] 引用
+    enable_item_reinforcement: bool = False     # 启用 reinforcement + content_hash 去重
 ```
+
+`CustomPrompt` 用于"按块覆盖"提示词，例如只替换 `examples` 块：
+
+```python
+service = MemoryService(
+    memorize_config={
+        "memory_type_prompts": {
+            "profile": {"examples": "## My custom example\n..."},  # 只覆盖 examples 块
+        },
+    },
+)
+```
+
+### 关于 `enable_item_reinforcement`
+
+打开后，**完全相同内容**的记忆不再重复入库，而是把已有记忆的 `extra.reinforcement_count` 自增、`extra.last_reinforced_at` 刷新为当前时间。检索阶段还可以把它和向量相似度组合成 salience-aware 排序——这部分见第 09 篇。
 
 ## 7. 实际使用示例
 

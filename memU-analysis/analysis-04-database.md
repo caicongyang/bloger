@@ -129,27 +129,38 @@ class MemoryItem(BaseRecord):
     memory_type: str              # 记忆类型
     summary: str                  # 记忆内容
     embedding: list[float] | None # 语义向量
-    happened_at: datetime | None # 发生时间
-    extra: dict[str, Any]         # 扩展字段
+    happened_at: datetime | None  # 发生时间
+    extra: dict[str, Any]         # 扩展字段（见下）
 ```
 
-**extra 字段可能包含**：
-```python
-{
-    # 强化记忆相关
-    "content_hash": str,
-    "reinforcement_count": int,
-    "last_reinforced_at": str,
-    
-    # 引用相关
-    "ref_id": str,
-    
-    # 工具记忆相关
-    "when_to_use": str,
-    "metadata": dict,
-    "tool_calls": list[ToolCallResult]
-}
-```
+#### 关键设计：`extra` 是一个"按需扩展"的口袋
+
+memU **没有**把 `reinforcement_count` / `content_hash` 这些定义成 `MemoryItem` 的一等字段，而是统一塞进 `extra: dict`。原因有二：
+
+1. **不破坏数据库 schema**：在 SQL 后端中 `extra` 是一个 JSON 列，新加字段无需迁表；
+2. **不同记忆类型用不同子结构**：例如只有 tool 记忆才有 `tool_calls`，普通 profile 记忆带它就是浪费。
+
+实际可能出现的字段：
+
+| 字段 | 由谁写入 | 含义 |
+|------|---------|------|
+| `content_hash` | `create_item_reinforce` | `sha256(memory_type + summary)`，作为同 user scope 内的去重键 |
+| `reinforcement_count` | 同上 | 该记忆被反复确认的次数，初始为 1 |
+| `last_reinforced_at` | 同上 | ISO8601 时间戳，最近一次被强化的时间 |
+| `ref_id` | `_persist_item_references` | 用于支持类别摘要中的 `[ref:ITEM_ID]` 引用 |
+| `when_to_use` | tool memory | "什么时候该调用这个工具"的人类语言说明 |
+| `metadata` | tool memory | 工具的结构化元信息（参数 schema 等） |
+| `tool_calls` | tool memory | 历史调用的 input/output 样本 |
+
+#### 为什么 `extra` 这种设计很关键？
+
+如果你打算二次开发 memU，几乎所有"加一点东西又不想破坏既有代码"的场景，都可以塞进 `extra`：
+
+- 给某条记忆加 `confidence_score`
+- 给某条记忆打 `tags`（文章/笔记的多标签）
+- 标注 `source_session_id`，方便后期审计
+
+—— 都不需要改 SQLAlchemy 模型，只需要在自己的 step handler / interceptor 里读写 `extra` 即可。代价是这些字段没有索引，查询性能依赖于在 user scope 上先收窄候选集，再在 Python / JSON 函数里二次过滤。
 
 ### 3.4 MemoryCategory (类别)
 
@@ -230,34 +241,89 @@ class SQLiteDatabase:
 
 ### 5.1 InMemory 向量搜索
 
-```python
-# src/memu/database/inmemory/vector.py
-def cosine_topk(query_vector: list[float], vectors: list[list[float]], top_k: int):
-    """计算余弦相似度并返回 Top-K"""
-    
-    # 归一化
-    query_norm = normalize(query_vector)
-    vector_norms = normalize_vectors(vectors)
-    
-    # 计算点积
-    similarities = dot(query_norm, vector_norms)
-    
-    # 排序取 Top-K
-    top_indices = np.argsort(similarities)[-top_k:][::-1]
-    
-    return [(idx, similarities[idx]) for idx in top_indices]
+memU 的内存实现做了一点**性能小优化**——用 `argpartition` 代替全排序：
+
+```56:91:memU/src/memu/database/inmemory/vector.py
+def cosine_topk(
+    query_vec: list[float],
+    corpus: Iterable[tuple[str, list[float] | None]],
+    k: int = 5,
+) -> list[tuple[str, float]]:
+    ids: list[str] = []
+    vecs: list[list[float]] = []
+    for _id, vec in corpus:
+        if vec is not None:
+            ids.append(_id)
+            vecs.append(cast(list[float], vec))
+
+    if not vecs:
+        return []
+
+    q = np.array(query_vec, dtype=np.float32)
+    matrix = np.array(vecs, dtype=np.float32)
+
+    q_norm = np.linalg.norm(q)
+    vec_norms = np.linalg.norm(matrix, axis=1)
+    scores = matrix @ q / (vec_norms * q_norm + 1e-9)
+
+    n = len(scores)
+    actual_k = min(k, n)
+    if actual_k == n:
+        topk_indices = np.argsort(scores)[::-1]
+    else:
+        # O(n) topk vs O(n log n) full sort
+        topk_indices = np.argpartition(scores, -actual_k)[-actual_k:]
+        topk_indices = topk_indices[np.argsort(scores[topk_indices])[::-1]]
+
+    return [(ids[i], float(scores[i])) for i in topk_indices]
 ```
 
-### 5.2 PostgreSQL 向量搜索
+> 注意 `+ 1e-9` 防止零向量除零。
+
+### 5.2 Salience-aware 向量搜索
+
+通过 `RetrieveItemConfig.ranking="salience"`，召回阶段会切换到 `cosine_topk_salience`，把"反复确认次数 + 最近被提及程度"也纳入排序：
+
+```94:127:memU/src/memu/database/inmemory/vector.py
+def cosine_topk_salience(
+    query_vec: list[float],
+    corpus: Iterable[tuple[str, list[float] | None, int, datetime | None]],
+    k: int = 5,
+    recency_decay_days: float = 30.0,
+) -> list[tuple[str, float]]:
+    """
+    Top-k retrieval using salience-aware scoring.
+
+    Ranks memories by: similarity * log(reinforcement+1) * recency_decay
+    """
+    q = np.array(query_vec, dtype=np.float32)
+    scored: list[tuple[str, float]] = []
+
+    for _id, vec, reinforcement_count, last_reinforced_at in corpus:
+        if vec is None:
+            continue
+        ...
+        score = salience_score(similarity, reinforcement_count, last_reinforced_at, recency_decay_days)
+        scored.append((_id, score))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored[:k]
+```
+
+更详细的设计动机见 [第 09 篇：记忆强化与 Salience 评分](./analysis-09-salience-and-reinforcement.md)。
+
+### 5.3 PostgreSQL 向量搜索
 
 ```sql
--- 使用 pgvector 的余弦距离
-SELECT id, summary, 
+-- 使用 pgvector 的余弦距离运算符 <=>
+SELECT id, summary,
        1 - (embedding <=> $query_vector) AS similarity
 FROM memory_items
 ORDER BY embedding <=> $query_vector
 LIMIT $top_k;
 ```
+
+PostgreSQL 后端的实现位于 `src/memu/database/postgres/postgres.py`，构造时会根据 `vector_provider == "pgvector"` 决定是否启用真正的 vector 列；否则退化为存 JSON + Python 端排序。
 
 ## 6. 用户作用域 (User Scope)
 
@@ -341,44 +407,63 @@ class ResourceRepository(Protocol):
     ) -> list[tuple[Resource, float]]: ...
 ```
 
-### 7.2 MemoryItemRepository
+### 7.2 MemoryItemRepo
 
-```python
-class MemoryItemRepository(Protocol):
+实际接口在 `src/memu/database/repositories/memory_item.py` 中以 Protocol 形式给出：
+
+```9:54:memU/src/memu/database/repositories/memory_item.py
+@runtime_checkable
+class MemoryItemRepo(Protocol):
+    """Repository contract for memory items."""
+
+    items: dict[str, MemoryItem]
+
+    def get_item(self, item_id: str) -> MemoryItem | None: ...
+
+    def list_items(self, where: Mapping[str, Any] | None = None) -> dict[str, MemoryItem]: ...
+
+    def clear_items(self, where: Mapping[str, Any] | None = None) -> dict[str, MemoryItem]: ...
+
     def create_item(
         self,
-        resource_id: str | None,
-        memory_type: str,
+        *,
+        resource_id: str,
+        memory_type: MemoryType,
         summary: str,
-        embedding: list[float] | None = None,
-        user_data: dict | None = None,
+        embedding: list[float],
+        user_data: dict[str, Any],
         reinforce: bool = False,
+        tool_record: dict[str, Any] | None = None,
     ) -> MemoryItem: ...
-    
-    def get_item(self, item_id: str) -> MemoryItem | None: ...
-    
+
     def update_item(
         self,
+        *,
         item_id: str,
+        memory_type: MemoryType | None = None,
         summary: str | None = None,
-        extra: dict | None = None,
-    ) -> MemoryItem | None: ...
-    
-    def list_items(
-        self,
-        memory_type: str | None = None,
-        where: dict | None = None,
-        limit: int = 100,
-    ) -> list[MemoryItem]: ...
-    
-    def search_by_embedding(
-        self,
-        query_vector: list[float],
-        top_k: int = 10,
-        memory_type: str | None = None,
-        where: dict | None = None,
-    ) -> list[tuple[MemoryItem, float]]: ...
+        embedding: list[float] | None = None,
+        extra: dict[str, Any] | None = None,
+        tool_record: dict[str, Any] | None = None,
+    ) -> MemoryItem: ...
+
+    def delete_item(self, item_id: str) -> None: ...
+
+    def list_items_by_ref_ids(
+        self, ref_ids: list[str], where: Mapping[str, Any] | None = None
+    ) -> dict[str, MemoryItem]: ...
+
+    def vector_search_items(
+        self, query_vec: list[float], top_k: int, where: Mapping[str, Any] | None = None
+    ) -> list[tuple[str, float]]: ...
 ```
+
+注意几个**与早期博客描述不一致的细节**：
+
+- 没有 `search_by_embedding`，只有 `vector_search_items`，且各后端实现可以接受**额外的 `ranking` / `recency_decay_days` 参数**（见 InMemory 实现的 `vector_search_items`）以启用 salience-aware 排序。
+- 没有 `memory_type=...` 这种内置过滤参数；按类型过滤需要走 `where`。
+- `tool_record` 是给工具记忆的专门入口，会被铺平到 `extra.{when_to_use, metadata, tool_calls}`。
+- `list_items` 返回的是 `dict[str, MemoryItem]`（item_id → MemoryItem），不是 list。
 
 ### 7.3 MemoryCategoryRepository
 
